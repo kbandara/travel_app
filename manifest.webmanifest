@@ -1,0 +1,14 @@
+{
+  "name": "Travel Expenses",
+  "short_name": "Expenses",
+  "description": "Multi-trip, multi-country travel spend tracker with live FX, cash pools and budgets.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f1e8d6",
+  "theme_color": "#f1e8d6",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}
