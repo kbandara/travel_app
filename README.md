@@ -11,7 +11,7 @@ A multi-trip, multi-country travel spend tracker that runs entirely in the brows
   - *Cash spends* — drawn down from the matching cash pool without being double counted (the trip total = card spends + ATM withdrawals).
 - **Live FX rates** from [open.er-api.com](https://open.er-api.com), cached for offline use, with a manual-rate fallback and an auto-refresh toggle.
 - **Budgets** — a whole-trip budget plus per-country budgets, with progress bars and over-budget warnings.
-- **Timeline** — entries grouped by country in visit order, with day headers, search, and filter chips (category / card / cash / ATM). Long lists are capped with "show all".
+- **Timeline** — newest first: entries grouped by country, most recently visited country on top, with day headers, search, and filter chips (category / card / cash / ATM). Long lists are capped with "show all".
 - **Insights** — average per day, largest spend, category breakdown, daily spend for the last 14 days, per-country totals, and a payment split. Cash spends are valued at your blended ATM rate.
 - **Editing** — edit, duplicate, or delete any entry; deletes offer a 6-second **Undo**.
 - **Home-currency switching** — totals for entries recorded under a different home currency are converted at current rates and marked with ≈ (never silently mixed).
