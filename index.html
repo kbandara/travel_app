@@ -1211,6 +1211,11 @@ function TimelineTab(props) {
     });
   }
   const active = q.trim() !== "" || filter !== "All";
+  /* Newest first: most recently visited country on top (items inside a group are already newest-first).
+     Ordered here rather than in buildGroups so the hero flag strip keeps the trip's travel order. */
+  const orderedGroups = useMemo(function () {
+    return groups.slice().sort(function (a, b) { return (b.end - a.end) || (b.start - a.start); });
+  }, [groups]);
   const flat = useMemo(function () {
     if (!active) return null;
     return txns.filter(matches).sort(function (a, b) { return new Date(b.timestamp) - new Date(a.timestamp); });
@@ -1240,7 +1245,7 @@ function TimelineTab(props) {
       chips.map(function (c) {
         return h("button", { type: "button", key: c, className: "t-fchip", "aria-pressed": filter === c, onClick: function () { setFilter(filter === c ? "All" : c); } }, c);
       })) : null,
-    active ? renderFlat() : h("div", null, groups.map(renderCountryGroup))
+    active ? renderFlat() : h("div", null, orderedGroups.map(renderCountryGroup))
   );
 
   function renderFlat() {
