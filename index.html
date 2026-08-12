@@ -511,6 +511,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
    - Home page listing trips; each trip is multi-country
    - Live FX rates (online), cached + manual fallback (offline-friendly)
    - Country timeline, ATM cash pools, per-country + whole-trip budgets
+   - Daily spending limits per category, checked against today's spend
    - Search & filters, insights (category / daily / country breakdowns)
    - Full backup & restore, per-trip CSV/JSON export, share-by-link snapshot
    - Installable PWA with a service worker (true offline)
@@ -774,6 +775,54 @@ function spendValueOf(t, pools, home, rates) {
   if (t.payment === "cash") { const v = impliedHomeOf(t, pools, home, rates); return isNaN(v) ? 0 : v; }
   return homeValueOf(t, home, rates).v;
 }
+
+/* ---- daily limits (a per-category ceiling for one day, in home currency) ---- */
+const OVER_EPS = 1e-4;
+function limitFor(limits, cat) {
+  const v = limits ? limits[cat] : null;
+  return typeof v === "number" && isFinite(v) && v > 0 ? v : null;
+}
+function sanitizeLimits(raw) {
+  const out = {};
+  if (raw && typeof raw === "object") {
+    CATEGORIES.forEach(function (c) { const v = Number(raw[c]); if (isFinite(v) && v > 0) out[c] = v; });
+  }
+  return out;
+}
+/* what each category cost on one calendar day; ATM cash-outs are excluded —
+   like every other breakdown, cash counts when it's spent, not when withdrawn */
+function dailySpendByCategory(txns, dateStr, pools, home, rates) {
+  const out = {};
+  for (let i = 0; i < txns.length; i++) {
+    const t = txns[i];
+    if (t.type === "withdrawal") continue;
+    if (dateStrFromTs(t.timestamp) !== dateStr) continue;
+    const cat = t.category || "Other";
+    out[cat] = (out[cat] || 0) + spendValueOf(t, pools, home, rates);
+  }
+  return out;
+}
+/* one row per limited category: spent, what's left, and whether it's blown */
+function dailyLimitStatus(limits, spentByCat) {
+  const rows = [], over = [];
+  let limitTotal = 0, spentTotal = 0, overBy = 0;
+  CATEGORIES.forEach(function (cat) {
+    const limit = limitFor(limits, cat);
+    if (limit === null) return;
+    const spent = (spentByCat && spentByCat[cat]) || 0;
+    const remaining = limit - spent;
+    const isOver = remaining < -OVER_EPS;
+    limitTotal += limit; spentTotal += spent;
+    if (isOver) { over.push(cat); overBy += -remaining; }
+    rows.push({ category: cat, limit: limit, spent: spent, remaining: remaining, over: isOver, pct: (spent / limit) * 100 });
+  });
+  return { rows: rows, over: over, overBy: overBy, limitTotal: limitTotal, spentTotal: spentTotal, remainingTotal: limitTotal - spentTotal };
+}
+/* "Food", "Food and Transport", "Food, Transport and Stay" */
+function listWords(arr) {
+  if (arr.length <= 1) return arr[0] || "";
+  return arr.slice(0, -1).join(", ") + " and " + arr[arr.length - 1];
+}
 function buildGroups(txns, home, rates) {
   const map = {};
   for (let i = 0; i < txns.length; i++) { const t = txns[i]; const k = t.country || "Other"; (map[k] || (map[k] = [])).push(t); }
@@ -875,7 +924,7 @@ function sanitizeShared(payload) {
   }
   const budgetTotal = Number(payload.trip.budgetTotal);
   return {
-    name: name, budgets: budgets,
+    name: name, budgets: budgets, dailyLimits: sanitizeLimits(payload.trip.dailyLimits),
     budgetTotal: isFinite(budgetTotal) && budgetTotal > 0 ? budgetTotal : undefined,
     colorIndex: Number(payload.trip.colorIndex) || 0,
     txns: (Array.isArray(payload.txns) ? payload.txns : []).slice(0, 5000)
@@ -913,7 +962,7 @@ function bootstrap() {
 
   if (!trips || !trips.length) {
     if (txns.length || hasOldBudgets) {
-      const t = { id: uid(), name: "My Trip", colorIndex: 0, budgets: oldBudgets, createdAt: Date.now() };
+      const t = { id: uid(), name: "My Trip", colorIndex: 0, budgets: oldBudgets, dailyLimits: {}, createdAt: Date.now() };
       txns = txns.map(function (x) { return x.tripId ? x : Object.assign({}, x, { tripId: t.id }); });
       trips = [t];
     } else { trips = []; }
@@ -934,7 +983,7 @@ function bootstrap() {
   trips.forEach(function (t) { known[t.id] = 1; });
   const orphans = txns.filter(function (t) { return !known[t.tripId]; });
   if (orphans.length) {
-    const rt = { id: uid(), name: "Recovered entries", colorIndex: nextColorIndex(trips), budgets: {}, createdAt: Date.now() };
+    const rt = { id: uid(), name: "Recovered entries", colorIndex: nextColorIndex(trips), budgets: {}, dailyLimits: {}, createdAt: Date.now() };
     txns = txns.map(function (t) { return known[t.tripId] ? t : Object.assign({}, t, { tripId: rt.id }); });
     trips = trips.concat([rt]);
   }
@@ -1171,6 +1220,91 @@ function EntryCard(props) {
     );
   }
 }
+
+/* ========================= daily limits card ========================= */
+/* A ceiling per category for a single day, checked against what today
+   has cost so far. Own draft state so typing doesn't re-render the trip. */
+function DailyLimitsCard(props) {
+  const home = props.home, limits = props.limits, status = props.status, editing = props.editing;
+  const draftS = useState({}); const draft = draftS[0], setDraft = draftS[1];
+
+  /* seed the inputs from the saved limits each time the editor opens */
+  useEffect(function () {
+    if (!editing) return;
+    const d = {};
+    CATEGORIES.forEach(function (c) { const v = limitFor(limits, c); d[c] = v === null ? "" : String(v); });
+    setDraft(d);
+  }, [editing]);
+
+  function setOne(cat, v) { setDraft(function (prev) { const next = Object.assign({}, prev); next[cat] = v; return next; }); }
+  function save() {
+    const next = {};
+    CATEGORIES.forEach(function (c) { const v = parseAmount(draft[c]); if (!isNaN(v) && v > 0) next[c] = v; });
+    props.onSave(next);
+    props.onClose();
+  }
+  function clearAll() { props.onSave({}); props.onClose(); }
+
+  if (editing) {
+    return h("section", { className: "t-card t-pad", style: { marginBottom: 16 } },
+      h("div", { className: "t-sectitle", style: { marginBottom: 6 } }, "Daily limits"),
+      h("div", { style: { fontSize: 12.5, color: "var(--faint)", marginBottom: 12 } },
+        "What you're happy to spend per day on each category, in " + home + ". Leave one blank for no limit."),
+      h("div", null, CATEGORIES.map(function (c) {
+        return h("div", { key: c, style: { display: "flex", alignItems: "center", gap: 12, marginBottom: 8 } },
+          h("label", { htmlFor: "dl-" + c, style: { flex: 1, minWidth: 0, fontSize: 14, fontWeight: 500 } }, c),
+          h("input", {
+            id: "dl-" + c, type: "text", inputMode: "decimal", className: "t-input t-tnum",
+            style: { flex: "0 0 120px", textAlign: "right" },
+            value: draft[c] === undefined ? "" : draft[c], placeholder: "none",
+            "aria-label": "Daily limit for " + c + " (" + home + ")",
+            onChange: function (e) { setOne(c, e.target.value); },
+            onKeyDown: function (e) { if (e.key === "Enter") { e.preventDefault(); save(); } if (e.key === "Escape") props.onClose(); } }));
+      })),
+      h("div", { style: { display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" } },
+        h("button", { type: "button", className: "t-btn t-btn-primary t-btn-sm", onClick: save }, "Save limits"),
+        h("button", { type: "button", className: "t-btn t-btn-ghost t-btn-sm", onClick: props.onClose }, "Cancel"),
+        status.rows.length
+          ? h("button", { type: "button", className: "t-btn t-btn-ghost t-btn-sm", style: { marginLeft: "auto" }, onClick: clearAll }, "Clear all")
+          : null));
+  }
+
+  if (!status.rows.length) {
+    return h("section", { className: "t-card t-pad", style: { marginBottom: 16 } },
+      h("div", { className: "t-sectitle", style: { marginBottom: 7 } }, "Daily limits"),
+      h("div", { style: { fontSize: 13, color: "var(--muted)" } },
+        "Cap what you spend per day on food, transport and the rest — this card then tells you where today stands."),
+      h("button", { type: "button", className: "t-link", style: { marginTop: 11 }, onClick: props.onEdit }, "+ Set daily limits"));
+  }
+
+  const over = status.over;
+  return h("section", { className: "t-card t-pad", style: { marginBottom: 16 } },
+    h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 10 } },
+      h("div", { className: "t-sectitle" }, "Daily limits · today"),
+      h("button", { type: "button", className: "t-link", style: { color: "var(--faint)" }, onClick: props.onEdit }, "Edit")),
+
+    over.length
+      ? h("div", { className: "t-warn", role: "status" },
+          "Over on " + listWords(over) + " · " + fmt(status.overBy, home) + " above " + (over.length === 1 ? "that limit" : "those limits") + " today.")
+      : h("div", { className: "t-note", role: "status" },
+          "Under today's limits · " + fmt(status.remainingTotal, home) + " still to spend."),
+
+    h("div", { style: { marginTop: 6 } }, status.rows.map(function (r) {
+      const barColor = r.over ? "var(--red)" : (r.pct >= 80 ? "var(--amber)" : "var(--accent)");
+      const width = Math.max(r.spent > 0 ? 2 : 0, Math.min(100, r.pct));
+      return h("div", { key: r.category, className: "t-hrow" },
+        h("div", { className: "t-hmeta" },
+          h("span", { className: "lbl" }, r.category),
+          h("span", { className: "val t-tnum" }, fmt(r.spent, home) + " / " + fmt(r.limit, home))),
+        h("div", { className: "t-bar" }, h("i", { style: { width: width + "%", background: barColor } })),
+        h("div", { className: "t-tnum", style: { marginTop: 4, fontSize: 11, color: r.over ? "var(--red)" : "var(--faint)" } },
+          r.over ? fmt(-r.remaining, home) + " over" : fmt(r.remaining, home) + " left"));
+    })),
+
+    h("div", { className: "t-tnum", style: { marginTop: 8, fontSize: 11.5, color: "var(--faint)" } },
+      "Spent today " + fmt(status.spentTotal, home) + " of " + fmt(status.limitTotal, home) + " in limits · resets each day"));
+}
+
 /* ============================ timeline tab ============================ */
 const GROUP_PREVIEW = 30;
 
@@ -1445,8 +1579,10 @@ function TripScreen(props) {
   const rates = props.rates;
   const setTxns = props.setTxns;
   const budgets = trip.budgets || {};
+  const dailyLimits = trip.dailyLimits || {};
 
   const tabS = useState("track"); const tab = tabS[0], setTab = tabS[1];
+  const dlES = useState(false); const dlEditing = dlES[0], setDlEditing = dlES[1];
   const editS = useState(null); const editing = editS[0], setEditing = editS[1];
   const menuS = useState(false); const menuOpen = menuS[0], setMenuOpen = menuS[1];
   const renS = useState(false); const renaming = renS[0], setRenaming = renS[1];
@@ -1463,6 +1599,10 @@ function TripScreen(props) {
     const times = txns.map(function (t) { return new Date(t.timestamp).getTime(); });
     return { start: Math.min.apply(null, times), end: Math.max.apply(null, times) };
   }, [txns]);
+  /* today's spend per category, checked against the trip's daily limits */
+  const dailyStatus = useMemo(function () {
+    return dailyLimitStatus(dailyLimits, dailySpendByCategory(txns, todayStr(), derived.pools, home, rates));
+  }, [txns, dailyLimits, derived, home, rates]);
   const tripCountries = useMemo(function () {
     const seen = {}, out = [];
     const sorted = txns.slice().sort(function (a, b) { return new Date(b.timestamp) - new Date(a.timestamp); });
@@ -1481,17 +1621,31 @@ function TripScreen(props) {
   }, [menuOpen]);
 
   /* ---- entry commit / edit / delete / duplicate ---- */
+  /* where the entry's day now stands against that category's daily limit */
+  function limitNote(item, nextList) {
+    if (item.type === "withdrawal") return "";
+    const limit = limitFor(dailyLimits, item.category);
+    if (limit === null) return "";
+    const ds = dateStrFromTs(item.timestamp);
+    const spent = dailySpendByCategory(nextList, ds, derived.pools, home, rates)[item.category] || 0;
+    const remaining = limit - spent;
+    const when = ds === todayStr() ? "today" : "that day";
+    return " · " + item.category + " " + (remaining < -OVER_EPS
+      ? fmt(-remaining, home) + " over " + when
+      : fmt(remaining, home) + " left " + when);
+  }
   function commit(item, isEdit) {
     if (isEdit) {
+      const next = txns.map(function (e) { return e.id === item.id ? item : e; });
       setTxns(function (prev) { return prev.map(function (e) { return e.id === item.id ? item : e; }); });
       setEditing(null);
-      props.onToast("Changes saved");
+      props.onToast("Changes saved" + limitNote(item, next));
     } else {
       setTxns(function (prev) { return [item].concat(prev); });
       const note = item.type === "withdrawal"
         ? "Cash-out added · " + fmt(num(item.amountHome), home)
         : (item.payment === "cash" ? "Added · " + fmtNum(item.amountTrip) + " " + item.tripCurrency + " cash" : "Added · ≈ " + fmt(num(item.amountHome), home));
-      props.onToast(note);
+      props.onToast(note + limitNote(item, [item].concat(txns)));
     }
   }
   function startEdit(t) {
@@ -1512,7 +1666,7 @@ function TripScreen(props) {
   function duplicateTxn(t) {
     const copy = Object.assign({}, t, { id: uid(), timestamp: new Date().toISOString() });
     setTxns(function (prev) { return [copy].concat(prev); });
-    props.onToast("Duplicated to today");
+    props.onToast("Duplicated to today" + limitNote(copy, [copy].concat(txns)));
   }
 
   /* ---- rename ---- */
@@ -1531,10 +1685,13 @@ function TripScreen(props) {
     setTbEditing(false); setTbStr("");
   }
 
+  /* ---- daily limits ---- */
+  function openDailyLimits() { setTab("track"); setDlEditing(true); setMenuOpen(false); }
+
   /* ---- export ---- */
   function slug() { return (trip.name || "trip").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") + "-" + new Date().toISOString().slice(0, 10); }
   function exportJSON() {
-    download(slug() + ".json", JSON.stringify({ exportedAt: new Date().toISOString(), trip: { name: trip.name, budgets: budgets, budgetTotal: trip.budgetTotal }, transactions: txns }, null, 2), "application/json");
+    download(slug() + ".json", JSON.stringify({ exportedAt: new Date().toISOString(), trip: { name: trip.name, budgets: budgets, budgetTotal: trip.budgetTotal, dailyLimits: dailyLimits }, transactions: txns }, null, 2), "application/json");
     setMenuOpen(false);
   }
   function csvSafe(v) {
@@ -1580,6 +1737,7 @@ function TripScreen(props) {
         menuOpen ? h("div", { className: "t-menu", role: "menu" },
           h("button", { type: "button", onClick: function () { setMenuOpen(false); setNameStr(trip.name); setRenaming(true); } }, h(EditIcon, null), "Rename trip"),
           h("button", { type: "button", onClick: openTripBudget }, h(CashIcon, null), tripBudget ? "Edit trip budget" : "Set trip budget"),
+          h("button", { type: "button", onClick: openDailyLimits }, h(CashIcon, null), dailyStatus.rows.length ? "Edit daily limits" : "Set daily limits"),
           h("div", { className: "sep" }),
           h("button", { type: "button", onClick: function () { setMenuOpen(false); props.onShare(); } }, h(ShareIcon, null), "Share trip"),
           h("button", { type: "button", onClick: exportCSV }, h(DownloadIcon, null), "Export CSV"),
@@ -1622,6 +1780,11 @@ function TripScreen(props) {
     tab === "track" ? h("div", null,
       h("div", { ref: entryRef },
         h(EntryCard, { home: home, rates: rates, pools: derived.pools, tripCountries: tripCountries, editing: editing, onCommit: commit, onCancelEdit: cancelEdit })),
+      h(DailyLimitsCard, {
+        home: home, limits: dailyLimits, status: dailyStatus, editing: dlEditing,
+        onEdit: function () { setDlEditing(true); }, onClose: function () { setDlEditing(false); },
+        onSave: props.onDailyLimits
+      }),
       poolCodes.length ? cashPoolsCard(poolCodes) : null,
       txns.length ? h("div", { style: { textAlign: "center", marginTop: 4 } },
         h("button", { type: "button", className: "t-link", onClick: function () { setTab("timeline"); } }, "View timeline →")) : null
@@ -1959,12 +2122,13 @@ function App() {
 
   /* trip CRUD */
   function newTrip(name) {
-    const t = { id: uid(), name: name, colorIndex: nextColorIndex(trips), budgets: {}, createdAt: Date.now() };
+    const t = { id: uid(), name: name, colorIndex: nextColorIndex(trips), budgets: {}, dailyLimits: {}, createdAt: Date.now() };
     setTrips(function (prev) { return prev.concat([t]); });
     setActiveId(t.id);
   }
   function renameTrip(id, name) { setTrips(function (prev) { return prev.map(function (t) { return t.id === id ? Object.assign({}, t, { name: name }) : t; }); }); }
   function setTripBudgets(id, budgets) { setTrips(function (prev) { return prev.map(function (t) { return t.id === id ? Object.assign({}, t, { budgets: budgets }) : t; }); }); }
+  function setTripDailyLimits(id, limits) { setTrips(function (prev) { return prev.map(function (t) { return t.id === id ? Object.assign({}, t, { dailyLimits: sanitizeLimits(limits) }) : t; }); }); }
   function setTripBudgetTotal(id, v) {
     setTrips(function (prev) { return prev.map(function (t) {
       if (t.id !== id) return t;
@@ -1986,7 +2150,7 @@ function App() {
     const trip = trips.filter(function (t) { return t.id === id; })[0];
     if (!trip) return;
     const mine = txns.filter(function (t) { return t.tripId === id; });
-    const payload = { v: 1, trip: { name: trip.name, colorIndex: trip.colorIndex, budgets: trip.budgets || {}, budgetTotal: trip.budgetTotal }, txns: mine };
+    const payload = { v: 1, trip: { name: trip.name, colorIndex: trip.colorIndex, budgets: trip.budgets || {}, budgetTotal: trip.budgetTotal, dailyLimits: trip.dailyLimits || {} }, txns: mine };
     const link = location.origin + location.pathname + "#trip=" + encodeShare(payload);
     copyText(link).then(function (ok) {
       if (!ok) showToast("Couldn't copy the link");
@@ -1995,7 +2159,7 @@ function App() {
     });
   }
   function addImportedTrip(shared) {
-    const t = { id: uid(), name: shared.name, colorIndex: nextColorIndex(trips), budgets: shared.budgets, createdAt: Date.now() };
+    const t = { id: uid(), name: shared.name, colorIndex: nextColorIndex(trips), budgets: shared.budgets, dailyLimits: shared.dailyLimits || {}, createdAt: Date.now() };
     if (shared.budgetTotal) t.budgetTotal = shared.budgetTotal;
     const items = shared.txns.map(function (x) { return sanitizeTxn(x, t.id); }).filter(Boolean);
     setTrips(function (prev) { return prev.concat([t]); });
@@ -2035,7 +2199,7 @@ function App() {
     if (data.app === "travel-expenses" && Array.isArray(data.trips) && Array.isArray(data.txns)) {
       if (!window.confirm("Replace everything on this device with this backup? Current trips will be overwritten.")) return;
       const cleanTrips = data.trips.filter(function (t) { return t && t.id && t.name; }).map(function (t) {
-        const ct = { id: String(t.id), name: String(t.name).slice(0, 80), colorIndex: Number(t.colorIndex) || 0, budgets: {}, createdAt: Number(t.createdAt) || Date.now() };
+        const ct = { id: String(t.id), name: String(t.name).slice(0, 80), colorIndex: Number(t.colorIndex) || 0, budgets: {}, dailyLimits: sanitizeLimits(t.dailyLimits), createdAt: Number(t.createdAt) || Date.now() };
         if (t.budgets && typeof t.budgets === "object") Object.keys(t.budgets).slice(0, 100).forEach(function (k) { const v = Number(t.budgets[k]); if (isFinite(v) && v > 0) ct.budgets[String(k).slice(0, 60)] = v; });
         const bt = Number(t.budgetTotal); if (isFinite(bt) && bt > 0) ct.budgetTotal = bt;
         return ct;
@@ -2094,6 +2258,7 @@ function App() {
           setTxns: makeTripSetter(activeTrip.id),
           onBudgets: function (b) { setTripBudgets(activeTrip.id, b); },
           onTripBudget: function (v) { setTripBudgetTotal(activeTrip.id, v); },
+          onDailyLimits: function (l) { setTripDailyLimits(activeTrip.id, l); },
           onBack: function () { setActiveId(null); }, onRename: function (n) { renameTrip(activeTrip.id, n); },
           onDelete: function () { deleteTrip(activeTrip.id); }, onShare: function () { shareTrip(activeTrip.id); },
           theme: theme, onToggleTheme: toggleTheme, onToast: showToast

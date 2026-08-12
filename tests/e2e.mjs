@@ -131,6 +131,18 @@ try {
   await page.click("button:has-text('Save')");
   await page.waitForSelector("text=A$890.00 left");
   ok(true, "trip budget bar shows A$890.00 left");
+
+  /* daily limits per category (Food today = A$10 card + A$12.50 cash) */
+  await page.click("text=+ Set daily limits");
+  await page.fill("#dl-Food", "20");
+  await page.fill("#dl-Transport", "30");
+  await page.click("button:has-text('Save limits')");
+  await page.waitForSelector("text=Over on Food");
+  const dailyCard = await textOf(page, ".t-card:has-text('Daily limits')");
+  ok(dailyCard.includes("A$22.50 / A$20.00") && dailyCard.includes("A$2.50 over"), "Food today: A$22.50 of A$20.00 — A$2.50 over");
+  ok(dailyCard.includes("A$2.50 above that limit today"), "over-limit banner names the amount");
+  ok(dailyCard.includes("A$30.00 left"), "Transport untouched today — A$30.00 left");
+  ok(dailyCard.includes("Spent today A$22.50 of A$50.00 in limits"), "daily totals line sums the limited categories");
   await page.screenshot({ path: path.join(SHOTS, "2-trip-track.png") });
   await noHScroll(page, "trip track");
 
@@ -169,6 +181,8 @@ try {
   ok(true, "edit prefills the entry card");
   await page.fill("#f-amt", "250000");
   await page.click("button:has-text('Save changes')");
+  const overToast = await page.waitForSelector("text=Food A$5.63 over today", { timeout: 5000 }).then(() => true, () => false);
+  ok(overToast, "save toast warns the entry puts Food A$5.63 over today's limit");
   await page.waitForFunction(() => document.body.innerText.includes("1,350,000 VND"));
   ok(true, "edited amount reflows the cash pool (1,350,000 VND left)");
 
@@ -234,6 +248,7 @@ try {
   /* share -> import */
   await page.click(".t-trip");
   await page.waitForSelector("text=Tap to rename");
+  ok((await textOf(page, "body")).includes("A$5.63 over"), "daily limits survive a reload and re-check today's spend");
   await page.click('[aria-label="Trip menu"]');
   await page.click("text=Share trip");
   await page.waitForSelector(".t-toast");
@@ -257,6 +272,8 @@ try {
   await dl.saveAs(backupPath);
   const backup = JSON.parse(fs.readFileSync(backupPath, "utf8"));
   ok(backup.app === "travel-expenses" && backup.trips.length === 2 && backup.txns.length === 6, "backup file contains 2 trips / 6 entries");
+  ok(backup.trips.every((t) => t.dailyLimits && t.dailyLimits.Food === 20 && t.dailyLimits.Transport === 30),
+    "daily limits are in the backup for both trips (the shared copy carried them too)");
 
   await page.click("text=Erase all data");
   await page.waitForSelector("text=No trips yet");
@@ -269,6 +286,11 @@ try {
   await page.waitForSelector("text=Backup restored");
   await page.waitForFunction(() => document.querySelectorAll(".t-trip").length === 2);
   ok((await textOf(page, "body")).includes("A$110.00"), "restore brings both trips back with correct totals");
+  await page.click(".t-trip");
+  await page.waitForSelector("text=Daily limits");
+  ok((await textOf(page, "body")).includes("A$5.63 over"), "restored trip keeps its daily limits");
+  await page.click('[aria-label="Back to trips"]');
+  await page.waitForSelector("text=Your trips");
 
   /* dark mode + persistence of theme */
   await page.click('[aria-label="Toggle dark mode"]');
