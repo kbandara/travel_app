@@ -11,6 +11,7 @@ A multi-trip, multi-country travel spend tracker that runs entirely in the brows
   - *Cash spends* — drawn down from the matching cash pool without being double counted (the trip total = card spends + ATM withdrawals).
 - **Live FX rates** from [open.er-api.com](https://open.er-api.com), cached for offline use, with a manual-rate fallback and an auto-refresh toggle.
 - **Budgets** — a whole-trip budget plus per-country budgets, with progress bars and over-budget warnings.
+- **Daily limits** — a per-category daily cap (Food, Transport, Stay, Activities, Shopping, Other). The Track tab shows today's spend against each limit and says plainly whether you're under or over, and every entry you add, edit or duplicate reports what that category has left for the day. Limits are per trip, in your home currency, and reset each calendar day.
 - **Timeline** — newest first: entries grouped by country, most recently visited country on top, with day headers, search, and filter chips (category / card / cash / ATM). Long lists are capped with "show all".
 - **Insights** — average per day, largest spend, category breakdown, daily spend for the last 14 days, per-country totals, and a payment split. Cash spends are valued at your blended ATM rate.
 - **Editing** — edit, duplicate, or delete any entry; deletes offer a 6-second **Undo**.
@@ -36,7 +37,7 @@ When you change any cached file, bump `VERSION` in `sw.js` so installed clients 
 
 ## Tests
 
-An end-to-end Playwright suite drives the real app in Chromium — entries, cash pools, budgets, filters, undo, insights math, currency switching, share/import, backup/restore, legacy-data migration, and offline start via the service worker:
+An end-to-end Playwright suite drives the real app in Chromium — entries, cash pools, budgets, daily limits, filters, undo, insights math, currency switching, share/import, backup/restore, legacy-data migration, and offline start via the service worker:
 
 ```sh
 npm install --no-save playwright   # once; downloads may need `npx playwright install chromium`
