@@ -137,8 +137,12 @@ input[type=date].t-input{min-height:46px}
 .t-tripaccent{width:50px;height:50px;border-radius:14px;flex:none;display:flex;align-items:center;justify-content:center;font-size:21px;color:var(--tile-ink);font-family:var(--serif);box-shadow:inset 0 0 0 1px rgba(0,0,0,.06)}
 
 /* ============ bars, tiles, charts ============ */
-.t-bar{height:6px;border-radius:999px;background:var(--track);overflow:hidden}
+.t-bar{position:relative;height:6px;border-radius:999px;background:var(--track);overflow:hidden}
 .t-bar>i{display:block;height:100%;border-radius:999px;transition:width .4s ease;background:var(--accent)}
+.t-bar>.t-pace{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;border-radius:2px;background:var(--ink-soft);opacity:.6;transition:left .4s ease}
+.t-dayrow{display:flex;align-items:baseline;justify-content:space-between;gap:10px;font-size:12.5px;margin-bottom:5px}
+.t-dayrow .day{color:var(--ink-soft);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.t-dayrow .amt{color:var(--ink);font-weight:600;flex:none}
 .t-tiles{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .t-tile{background:var(--field-bg);border:1px solid var(--line-soft);border-radius:13px;padding:12px 14px;min-width:0}
 .t-tile b{display:block;font-family:var(--serif);font-weight:600;font-size:20px;letter-spacing:-.01em;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -511,7 +515,9 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
    - Home page listing trips; each trip is multi-country
    - Live FX rates (online), cached + manual fallback (offline-friendly)
    - Country timeline, ATM cash pools, per-country + whole-trip budgets
-   - Daily spending limits per category, checked against today's spend
+   - Daily spending limits per category (plus your own, country-pinned ones),
+     checked against today's spend and kept as a day-by-day history
+   - Trip start/end dates, so the budget can be paced against the day you're on
    - Search & filters, insights (category / daily / country breakdowns)
    - Full backup & restore, per-trip CSV/JSON export, share-by-link snapshot
    - Installable PWA with a service worker (true offline)
@@ -776,52 +782,136 @@ function spendValueOf(t, pools, home, rates) {
   return homeValueOf(t, home, rates).v;
 }
 
+/* ---- your own categories (optionally pinned to one country) ---- */
+const MAX_CUSTOM_CATEGORIES = 12;
+function sanitizeCustomCategories(list) {
+  const out = [], seen = {};
+  (Array.isArray(list) ? list : []).forEach(function (c) {
+    if (!c || out.length >= MAX_CUSTOM_CATEGORIES) return;
+    const name = String(c.name || "").trim().replace(/\s+/g, " ").slice(0, 24);
+    const key = name.toLowerCase();
+    if (!name || seen[key]) return;
+    for (let i = 0; i < CATEGORIES.length; i++) if (CATEGORIES[i].toLowerCase() === key) return;
+    seen[key] = 1;
+    out.push({ name: name, country: String(c.country || "").slice(0, 60) });
+  });
+  return out;
+}
+function customCatNames(list) { return (list || []).map(function (c) { return c.name; }); }
+/* category -> the country it's pinned to ("" / absent = everywhere) */
+function catCountryMap(list) {
+  const m = {};
+  (list || []).forEach(function (c) { if (c && c.name) m[c.name] = c.country || ""; });
+  return m;
+}
+/* categories offered when logging an entry in <country>; `keep` is the value
+   already on the entry, so editing never silently relabels it */
+function categoriesFor(customs, country, keep) {
+  const out = CATEGORIES.slice();
+  (customs || []).forEach(function (c) { if ((!c.country || c.country === country) && out.indexOf(c.name) < 0) out.push(c.name); });
+  if (keep && out.indexOf(keep) < 0) out.push(keep);
+  return out;
+}
+function catIndex(cat) { const i = CATEGORIES.indexOf(cat); return i >= 0 ? i : CATEGORIES.length; }
+
 /* ---- daily limits (a per-category ceiling for one day, in home currency) ---- */
 const OVER_EPS = 1e-4;
 function limitFor(limits, cat) {
   const v = limits ? limits[cat] : null;
   return typeof v === "number" && isFinite(v) && v > 0 ? v : null;
 }
-function sanitizeLimits(raw) {
+function sanitizeLimits(raw, extraCats) {
   const out = {};
-  if (raw && typeof raw === "object") {
-    CATEGORIES.forEach(function (c) { const v = Number(raw[c]); if (isFinite(v) && v > 0) out[c] = v; });
-  }
+  if (!raw || typeof raw !== "object") return out;
+  CATEGORIES.concat(extraCats || []).forEach(function (c) {
+    const v = Number(raw[c]);
+    if (isFinite(v) && v > 0) out[c] = v;
+  });
   return out;
 }
-/* what each category cost on one calendar day; ATM cash-outs are excluded —
-   like every other breakdown, cash counts when it's spent, not when withdrawn */
-function dailySpendByCategory(txns, dateStr, pools, home, rates) {
-  const out = {};
-  for (let i = 0; i < txns.length; i++) {
-    const t = txns[i];
-    if (t.type === "withdrawal") continue;
-    if (dateStrFromTs(t.timestamp) !== dateStr) continue;
+/* entries bucketed by calendar day — every daily view reads from this */
+function bucketByDay(txns) {
+  const m = {};
+  for (let i = 0; i < txns.length; i++) { const k = dateStrFromTs(txns[i].timestamp); (m[k] || (m[k] = [])).push(txns[i]); }
+  return m;
+}
+/* what one day cost by category, and which countries you were in. ATM cash-outs
+   are excluded — like every other breakdown, cash counts when it's spent. */
+function daySummary(dayTxns, dateStr, pools, home, rates) {
+  const byCat = {}, countries = {};
+  let total = 0;
+  (dayTxns || []).forEach(function (t) {
+    if (t.country) countries[t.country] = 1;
+    if (t.type === "withdrawal") return;
     const cat = t.category || "Other";
-    out[cat] = (out[cat] || 0) + spendValueOf(t, pools, home, rates);
-  }
-  return out;
+    const v = spendValueOf(t, pools, home, rates);
+    byCat[cat] = (byCat[cat] || 0) + v;
+    total += v;
+  });
+  return { date: dateStr, byCat: byCat, countries: countries, total: total };
 }
-/* one row per limited category: spent, what's left, and whether it's blown */
-function dailyLimitStatus(limits, spentByCat) {
-  const rows = [], over = [];
+/* One row per limit that applies to this day. A country-pinned category only
+   applies on days you were in that country (or already spent on it there). */
+function dailyLimitStatus(limits, day, catCountries) {
+  const rows = [], over = [], dormant = [];
   let limitTotal = 0, spentTotal = 0, overBy = 0;
-  CATEGORIES.forEach(function (cat) {
+  Object.keys(limits || {}).forEach(function (cat) {
     const limit = limitFor(limits, cat);
     if (limit === null) return;
-    const spent = (spentByCat && spentByCat[cat]) || 0;
+    const spent = (day && day.byCat[cat]) || 0;
+    const country = (catCountries && catCountries[cat]) || "";
+    if (country && spent <= 0 && !(day && day.countries[country])) { dormant.push({ category: cat, limit: limit, country: country }); return; }
     const remaining = limit - spent;
     const isOver = remaining < -OVER_EPS;
     limitTotal += limit; spentTotal += spent;
     if (isOver) { over.push(cat); overBy += -remaining; }
-    rows.push({ category: cat, limit: limit, spent: spent, remaining: remaining, over: isOver, pct: (spent / limit) * 100 });
+    rows.push({ category: cat, country: country, limit: limit, spent: spent, remaining: remaining, over: isOver, pct: (spent / limit) * 100 });
   });
-  return { rows: rows, over: over, overBy: overBy, limitTotal: limitTotal, spentTotal: spentTotal, remainingTotal: limitTotal - spentTotal };
+  const order = function (a, b) { return (catIndex(a.category) - catIndex(b.category)) || (a.category < b.category ? -1 : 1); };
+  rows.sort(order); dormant.sort(order);
+  over.sort(function (a, b) { return catIndex(a) - catIndex(b); });
+  return { rows: rows, over: over, overBy: overBy, dormant: dormant,
+    limitTotal: limitTotal, spentTotal: spentTotal, remainingTotal: limitTotal - spentTotal };
+}
+/* how every day of the trip went against those limits, newest first */
+function limitHistory(buckets, limits, catCountries, pools, home, rates) {
+  return Object.keys(buckets).sort().reverse().map(function (ds) {
+    const day = daySummary(buckets[ds], ds, pools, home, rates);
+    return { date: ds, day: day, status: dailyLimitStatus(limits, day, catCountries) };
+  }).filter(function (d) { return d.status.rows.length > 0; });
 }
 /* "Food", "Food and Transport", "Food, Transport and Stay" */
 function listWords(arr) {
   if (arr.length <= 1) return arr[0] || "";
   return arr.slice(0, -1).join(", ") + " and " + arr[arr.length - 1];
+}
+
+/* ---- trip length & budget pace ---- */
+function dayMs(dateStr) { const d = new Date(dateStr + "T12:00:00"); return isNaN(d.getTime()) ? NaN : d.getTime(); }
+function daysBetween(a, b) { const x = dayMs(a), y = dayMs(b); return isNaN(x) || isNaN(y) ? NaN : Math.round((y - x) / 86400000); }
+function validDateStr(v) { return typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v) && !isNaN(dayMs(v)) ? v : ""; }
+/* Where today sits in a trip of a fixed length, and what the whole-trip budget
+   says you should have spent by the end of today. */
+function tripPace(trip, spent) {
+  const start = validDateStr(trip.startDate), end = validDateStr(trip.endDate);
+  if (!start || !end) return null;
+  const totalDays = daysBetween(start, end) + 1;
+  if (!isFinite(totalDays) || totalDays < 1) return null;
+  const offset = daysBetween(start, todayStr());
+  const started = offset >= 0, ended = offset > totalDays - 1;
+  const day = Math.min(totalDays, Math.max(0, offset + 1));
+  const budget = typeof trip.budgetTotal === "number" && trip.budgetTotal > 0 ? trip.budgetTotal : null;
+  const perDay = budget === null ? null : budget / totalDays;
+  const allowed = budget === null ? null : (!started ? 0 : perDay * day);
+  const daysLeft = !started ? totalDays : (ended ? 0 : totalDays - day + 1);
+  return {
+    start: start, end: end, totalDays: totalDays, day: day, started: started, ended: ended,
+    daysToStart: started ? 0 : -offset, budget: budget, perDay: perDay, allowed: allowed,
+    delta: allowed === null ? null : allowed - spent,          /* + = under pace */
+    daysLeft: daysLeft,
+    leftPerDay: budget === null || daysLeft <= 0 ? null : (budget - spent) / daysLeft,
+    pacePct: budget ? Math.max(0, Math.min(100, (allowed / budget) * 100)) : 0
+  };
 }
 function buildGroups(txns, home, rates) {
   const map = {};
@@ -907,7 +997,8 @@ function sanitizeTxn(x, tripId) {
     id: uid(), tripId: tripId, type: type, payment: payment,
     country: String(x.country || "Other").slice(0, 60),
     description: String(x.description || (type === "withdrawal" ? "ATM withdrawal" : "Expense")).slice(0, 140),
-    category: CATEGORIES.indexOf(x.category) >= 0 ? x.category : (type === "withdrawal" ? "Cash" : "Other"),
+    /* any label is kept (your own categories travel with the trip); it is only ever rendered as text */
+    category: String(x.category || "").trim().slice(0, 24) || (type === "withdrawal" ? "Cash" : "Other"),
     amountTrip: amountTrip,
     tripCurrency: String(x.tripCurrency || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 8),
     amountHome: amountHome, homeCurrency: String(x.homeCurrency || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 8) || undefined,
@@ -923,8 +1014,12 @@ function sanitizeShared(payload) {
     Object.keys(rawB).slice(0, 100).forEach(function (k) { const v = Number(rawB[k]); if (isFinite(v) && v > 0) budgets[String(k).slice(0, 60)] = v; });
   }
   const budgetTotal = Number(payload.trip.budgetTotal);
+  const customCategories = sanitizeCustomCategories(payload.trip.customCategories);
   return {
-    name: name, budgets: budgets, dailyLimits: sanitizeLimits(payload.trip.dailyLimits),
+    name: name, budgets: budgets,
+    customCategories: customCategories,
+    dailyLimits: sanitizeLimits(payload.trip.dailyLimits, customCatNames(customCategories)),
+    startDate: validDateStr(payload.trip.startDate), endDate: validDateStr(payload.trip.endDate),
     budgetTotal: isFinite(budgetTotal) && budgetTotal > 0 ? budgetTotal : undefined,
     colorIndex: Number(payload.trip.colorIndex) || 0,
     txns: (Array.isArray(payload.txns) ? payload.txns : []).slice(0, 5000)
@@ -962,7 +1057,7 @@ function bootstrap() {
 
   if (!trips || !trips.length) {
     if (txns.length || hasOldBudgets) {
-      const t = { id: uid(), name: "My Trip", colorIndex: 0, budgets: oldBudgets, dailyLimits: {}, createdAt: Date.now() };
+      const t = { id: uid(), name: "My Trip", colorIndex: 0, budgets: oldBudgets, dailyLimits: {}, customCategories: [], createdAt: Date.now() };
       txns = txns.map(function (x) { return x.tripId ? x : Object.assign({}, x, { tripId: t.id }); });
       trips = [t];
     } else { trips = []; }
@@ -983,7 +1078,7 @@ function bootstrap() {
   trips.forEach(function (t) { known[t.id] = 1; });
   const orphans = txns.filter(function (t) { return !known[t.tripId]; });
   if (orphans.length) {
-    const rt = { id: uid(), name: "Recovered entries", colorIndex: nextColorIndex(trips), budgets: {}, dailyLimits: {}, createdAt: Date.now() };
+    const rt = { id: uid(), name: "Recovered entries", colorIndex: nextColorIndex(trips), budgets: {}, dailyLimits: {}, customCategories: [], createdAt: Date.now() };
     txns = txns.map(function (t) { return known[t.tripId] ? t : Object.assign({}, t, { tripId: rt.id }); });
     trips = trips.concat([rt]);
   }
@@ -1087,7 +1182,7 @@ function EntryCard(props) {
     } else {
       setMode("expense"); setPayment(t.payment === "cash" ? "cash" : "card");
       setDesc(t.description === "Expense" ? "" : (t.description || ""));
-      setCategoryV(t.category && CATEGORIES.indexOf(t.category) >= 0 ? t.category : CATEGORIES[0]);
+      setCategoryV(t.category || CATEGORIES[0]);
       setAmountStr(String(t.amountTrip)); setRateStr(t.rate ? roundRate(t.rate) : "");
     }
   }, [editing]);
@@ -1097,6 +1192,11 @@ function EntryCard(props) {
     if (!currency || rateEditedRef.current) return;
     if (!isNaN(liveRate)) setRateStr(roundRate(liveRate));
   }, [currency, liveRate]);
+
+  /* base categories + the ones you added for this country (or for anywhere) */
+  const catOptions = useMemo(function () {
+    return categoriesFor(props.customCategories, country, categoryV);
+  }, [props.customCategories, country, categoryV]);
 
   const tripAmount = parseAmount(amountStr);
   const hasAmount = !isNaN(tripAmount) && tripAmount > 0;
@@ -1177,7 +1277,8 @@ function EntryCard(props) {
       ),
       h("div", { style: { marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 } },
         h("div", null, h("label", { className: "t-label", htmlFor: "f-cat" }, "Category"),
-          h("select", { id: "f-cat", className: "t-input", value: categoryV, onChange: function (e) { setCategoryV(e.target.value); } }, CATEGORIES.map(function (c) { return h("option", { key: c }, c); }))),
+          h("select", { id: "f-cat", className: "t-input", value: categoryV, onChange: function (e) { setCategoryV(e.target.value); } },
+            catOptions.map(function (c) { return h("option", { key: c }, c); }))),
         h("div", null, h("label", { className: "t-label", htmlFor: "f-amt" }, "Amount" + (currency ? " (" + currency + ")" : "")),
           h("input", { id: "f-amt", type: "text", inputMode: "decimal", className: "t-input t-tnum", value: amountStr, placeholder: "0", onChange: function (e) { setAmountStr(e.target.value); }, onKeyDown: onEnterExpense }))
       ),
@@ -1223,53 +1324,104 @@ function EntryCard(props) {
 
 /* ========================= daily limits card ========================= */
 /* A ceiling per category for a single day, checked against what today
-   has cost so far. Own draft state so typing doesn't re-render the trip. */
+   has cost so far. Your own categories are managed here too, since a
+   category you added exists to carry a budget. Own draft state so typing
+   doesn't re-render the trip. */
 function DailyLimitsCard(props) {
   const home = props.home, limits = props.limits, status = props.status, editing = props.editing;
   const draftS = useState({}); const draft = draftS[0], setDraft = draftS[1];
+  const catsS = useState([]); const cats = catsS[0], setCats = catsS[1];
+  const nameS = useState(""); const newName = nameS[0], setNewName = nameS[1];
+  const cnS = useState(""); const newCountry = cnS[0], setNewCountry = cnS[1];
+  const errS = useState(""); const err = errS[0], setErr = errS[1];
 
-  /* seed the inputs from the saved limits each time the editor opens */
+  /* seed the editor from what's saved each time it opens */
   useEffect(function () {
     if (!editing) return;
+    const saved = (props.categories || []).slice();
     const d = {};
-    CATEGORIES.forEach(function (c) { const v = limitFor(limits, c); d[c] = v === null ? "" : String(v); });
-    setDraft(d);
+    CATEGORIES.concat(customCatNames(saved)).forEach(function (c) { const v = limitFor(limits, c); d[c] = v === null ? "" : String(v); });
+    setDraft(d); setCats(saved); setNewName(""); setNewCountry(""); setErr("");
   }, [editing]);
 
   function setOne(cat, v) { setDraft(function (prev) { const next = Object.assign({}, prev); next[cat] = v; return next; }); }
-  function save() {
-    const next = {};
-    CATEGORIES.forEach(function (c) { const v = parseAmount(draft[c]); if (!isNaN(v) && v > 0) next[c] = v; });
-    props.onSave(next);
-    props.onClose();
+  function collect() {
+    const out = {};
+    CATEGORIES.concat(customCatNames(cats)).forEach(function (c) { const v = parseAmount(draft[c]); if (!isNaN(v) && v > 0) out[c] = v; });
+    return out;
   }
-  function clearAll() { props.onSave({}); props.onClose(); }
+  function save() { props.onSave({ limits: collect(), categories: cats }); props.onClose(); }
+  function clearAll() { props.onSave({ limits: {}, categories: cats }); props.onClose(); }
+  function addCategory() {
+    const name = newName.trim().replace(/\s+/g, " ").slice(0, 24);
+    if (!name) { setErr("Give the category a name."); return; }
+    const key = name.toLowerCase();
+    const taken = CATEGORIES.concat(customCatNames(cats)).some(function (c) { return c.toLowerCase() === key; });
+    if (taken) { setErr("“" + name + "” already exists."); return; }
+    if (cats.length >= MAX_CUSTOM_CATEGORIES) { setErr("That's the most categories a trip can hold."); return; }
+    setCats(cats.concat([{ name: name, country: newCountry }]));
+    setOne(name, "");
+    setNewName(""); setErr("");
+  }
+  function removeCategory(name) {
+    setCats(cats.filter(function (c) { return c.name !== name; }));
+    setDraft(function (prev) { const next = Object.assign({}, prev); delete next[name]; return next; });
+  }
+
+  function limitRow(cat, country, onRemove) {
+    return h("div", { key: cat, style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 8 } },
+      h("label", { htmlFor: "dl-" + cat, style: { flex: 1, minWidth: 0, fontSize: 14, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+        cat,
+        country ? h("span", { style: { color: "var(--faint)", fontWeight: 500, fontSize: 12 } }, "  " + flagForCountry(country) + " " + country) : null),
+      h("input", {
+        id: "dl-" + cat, type: "text", inputMode: "decimal", className: "t-input t-tnum",
+        style: { flex: "0 0 110px", textAlign: "right" },
+        value: draft[cat] === undefined ? "" : draft[cat], placeholder: "none",
+        "aria-label": "Daily limit for " + cat + " (" + home + ")",
+        onChange: function (e) { setOne(cat, e.target.value); },
+        onKeyDown: function (e) { if (e.key === "Enter") { e.preventDefault(); save(); } if (e.key === "Escape") props.onClose(); } }),
+      onRemove
+        ? h("button", { type: "button", className: "t-minibtn del", style: { flex: "none" }, "aria-label": "Remove the " + cat + " category", onClick: onRemove }, h(TrashIcon, null))
+        : null);
+  }
 
   if (editing) {
     return h("section", { className: "t-card t-pad", style: { marginBottom: 16 } },
       h("div", { className: "t-sectitle", style: { marginBottom: 6 } }, "Daily limits"),
       h("div", { style: { fontSize: 12.5, color: "var(--faint)", marginBottom: 12 } },
         "What you're happy to spend per day on each category, in " + home + ". Leave one blank for no limit."),
-      h("div", null, CATEGORIES.map(function (c) {
-        return h("div", { key: c, style: { display: "flex", alignItems: "center", gap: 12, marginBottom: 8 } },
-          h("label", { htmlFor: "dl-" + c, style: { flex: 1, minWidth: 0, fontSize: 14, fontWeight: 500 } }, c),
-          h("input", {
-            id: "dl-" + c, type: "text", inputMode: "decimal", className: "t-input t-tnum",
-            style: { flex: "0 0 120px", textAlign: "right" },
-            value: draft[c] === undefined ? "" : draft[c], placeholder: "none",
-            "aria-label": "Daily limit for " + c + " (" + home + ")",
-            onChange: function (e) { setOne(c, e.target.value); },
-            onKeyDown: function (e) { if (e.key === "Enter") { e.preventDefault(); save(); } if (e.key === "Escape") props.onClose(); } }));
-      })),
-      h("div", { style: { display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" } },
+      h("div", null, CATEGORIES.map(function (c) { return limitRow(c, "", null); })),
+
+      h("div", { className: "t-hairline" }),
+      h("div", { className: "t-label", style: { marginBottom: 8 } }, "Your own categories"),
+      cats.length
+        ? h("div", null, cats.map(function (c) {
+            return limitRow(c.name, c.country, function () { removeCategory(c.name); });
+          }))
+        : h("div", { style: { fontSize: 12.5, color: "var(--faint)", marginBottom: 10 } },
+            "Add one for the things this trip has that the standard list doesn't — pin it to a country and it only appears while you're there."),
+      h("div", { style: { display: "flex", gap: 8, alignItems: "center", marginTop: 4 } },
+        h("input", {
+          id: "dl-new", className: "t-input", style: { flex: 1, minWidth: 0 }, value: newName, placeholder: "e.g. HSR", maxLength: 24,
+          "aria-label": "New category name",
+          onChange: function (e) { setNewName(e.target.value); setErr(""); },
+          onKeyDown: function (e) { if (e.key === "Enter") { e.preventDefault(); addCategory(); } } }),
+        h("select", { id: "dl-new-country", className: "t-input", style: { flex: "0 0 42%", minWidth: 0 }, value: newCountry, "aria-label": "Country for the new category",
+          onChange: function (e) { setNewCountry(e.target.value); } },
+          h("option", { value: "" }, "Anywhere"),
+          COUNTRY_NAMES.map(function (cn) { return h("option", { key: cn, value: cn }, cn); })),
+        h("button", { type: "button", id: "dl-add", className: "t-btn t-btn-ghost t-btn-sm", style: { flex: "none" }, onClick: addCategory }, "Add")),
+      err ? h("div", { style: { marginTop: 8, fontSize: 12, color: "var(--red)" }, role: "alert" }, err) : null,
+
+      h("div", { style: { display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" } },
         h("button", { type: "button", className: "t-btn t-btn-primary t-btn-sm", onClick: save }, "Save limits"),
         h("button", { type: "button", className: "t-btn t-btn-ghost t-btn-sm", onClick: props.onClose }, "Cancel"),
-        status.rows.length
+        props.hasLimits
           ? h("button", { type: "button", className: "t-btn t-btn-ghost t-btn-sm", style: { marginLeft: "auto" }, onClick: clearAll }, "Clear all")
           : null));
   }
 
-  if (!status.rows.length) {
+  if (!props.hasLimits) {
     return h("section", { className: "t-card t-pad", style: { marginBottom: 16 } },
       h("div", { className: "t-sectitle", style: { marginBottom: 7 } }, "Daily limits"),
       h("div", { style: { fontSize: 13, color: "var(--muted)" } },
@@ -1287,22 +1439,29 @@ function DailyLimitsCard(props) {
       ? h("div", { className: "t-warn", role: "status" },
           "Over on " + listWords(over) + " · " + fmt(status.overBy, home) + " above " + (over.length === 1 ? "that limit" : "those limits") + " today.")
       : h("div", { className: "t-note", role: "status" },
-          "Under today's limits · " + fmt(status.remainingTotal, home) + " still to spend."),
+          status.rows.length
+            ? "Under today's limits · " + fmt(status.remainingTotal, home) + " still to spend."
+            : "None of your limits apply today — they're pinned to countries you're not in."),
 
-    h("div", { style: { marginTop: 6 } }, status.rows.map(function (r) {
+    status.rows.length ? h("div", { style: { marginTop: 6 } }, status.rows.map(function (r) {
       const barColor = r.over ? "var(--red)" : (r.pct >= 80 ? "var(--amber)" : "var(--accent)");
       const width = Math.max(r.spent > 0 ? 2 : 0, Math.min(100, r.pct));
       return h("div", { key: r.category, className: "t-hrow" },
         h("div", { className: "t-hmeta" },
-          h("span", { className: "lbl" }, r.category),
+          h("span", { className: "lbl" }, (r.country ? flagForCountry(r.country) + " " : "") + r.category),
           h("span", { className: "val t-tnum" }, fmt(r.spent, home) + " / " + fmt(r.limit, home))),
         h("div", { className: "t-bar" }, h("i", { style: { width: width + "%", background: barColor } })),
         h("div", { className: "t-tnum", style: { marginTop: 4, fontSize: 11, color: r.over ? "var(--red)" : "var(--faint)" } },
           r.over ? fmt(-r.remaining, home) + " over" : fmt(r.remaining, home) + " left"));
-    })),
+    })) : null,
 
-    h("div", { className: "t-tnum", style: { marginTop: 8, fontSize: 11.5, color: "var(--faint)" } },
-      "Spent today " + fmt(status.spentTotal, home) + " of " + fmt(status.limitTotal, home) + " in limits · resets each day"));
+    status.rows.length ? h("div", { className: "t-tnum", style: { marginTop: 8, fontSize: 11.5, color: "var(--faint)" } },
+      "Spent today " + fmt(status.spentTotal, home) + " of " + fmt(status.limitTotal, home) + " in limits · resets each day") : null,
+
+    status.dormant.length ? h("div", { style: { marginTop: 8, fontSize: 11.5, color: "var(--faint)" } },
+      "Waiting on a country · " + status.dormant.map(function (d) {
+        return flagForCountry(d.country) + " " + d.category + " " + fmt(d.limit, home) + "/day";
+      }).join(" · ")) : null);
 }
 
 /* ============================ timeline tab ============================ */
@@ -1485,8 +1644,17 @@ function TimelineTab(props) {
 }
 
 /* ============================ insights tab ============================ */
+const HISTORY_PREVIEW = 14;
+
 function InsightsTab(props) {
   const txns = props.txns, pools = props.pools, home = props.home, rates = props.rates, groups = props.groups, derived = props.derived;
+  const allDaysS = useState(false); const allDays = allDaysS[0], setAllDays = allDaysS[1];
+
+  /* day-by-day record against the daily limits, newest first */
+  const history = useMemo(function () {
+    if (!props.hasLimits) return [];
+    return limitHistory(props.buckets, props.limits, props.catCountries, pools, home, rates);
+  }, [props.buckets, props.limits, props.catCountries, props.hasLimits, pools, home, rates]);
 
   const ins = useMemo(function () {
     const byCat = {}, byDay = {}, daysSet = {};
@@ -1559,6 +1727,39 @@ function InsightsTab(props) {
         return h(HBar, { key: g.country, label: flagForCountry(g.country) + "  " + g.country, value: g.home, max: maxCountry, display: (g.approx ? "≈ " : "") + fmt(g.home, home), pct: pct });
       }))) : null,
 
+    history.length ? h("section", { className: "t-card t-pad", style: { marginBottom: 16 } },
+      (function () {
+        const clean = history.filter(function (d) { return !d.status.over.length; }).length;
+        const shown = allDays ? history : history.slice(0, HISTORY_PREVIEW);
+        const maxDay = Math.max.apply(null, history.map(function (d) { return Math.max(d.status.spentTotal, d.status.limitTotal); }).concat([0]));
+        return h("div", null,
+          h("div", { className: "t-sectitle", style: { marginBottom: 6 } }, "Daily limits · history"),
+          h("div", { style: { fontSize: 12.5, color: "var(--muted)", marginBottom: 4 } },
+            "Inside your limits on ", h("b", { className: "t-tnum", style: { color: "var(--ink)" } }, clean + " of " + history.length),
+            history.length === 1 ? " tracked day" : " tracked days", ", today's limits applied to each."),
+          h("div", null, shown.map(function (d) {
+            const st = d.status, isToday = d.date === todayStr();
+            const pct = st.limitTotal > 0 ? Math.min(100, (st.spentTotal / st.limitTotal) * 100) : 0;
+            const barColor = st.over.length ? "var(--red)" : (pct >= 80 ? "var(--amber)" : "var(--accent)");
+            return h("div", { key: d.date, className: "t-hrow" },
+              h("div", { className: "t-dayrow" },
+                h("span", { className: "day" }, fmtDayLabel(dayMs(d.date)) + (isToday ? " · today" : "")),
+                h("span", { className: "amt t-tnum" }, fmt(st.spentTotal, home) + " / " + fmt(st.limitTotal, home))),
+              /* every day is drawn to the same scale, with a tick at that day's limit */
+              h("div", { className: "t-bar" },
+                h("i", { style: { width: Math.max(st.spentTotal > 0 ? 2 : 0, Math.min(100, (st.spentTotal / maxDay) * 100)) + "%", background: barColor } }),
+                h("b", { className: "t-pace", style: { left: Math.min(100, (st.limitTotal / maxDay) * 100) + "%" }, title: "That day's limits" })),
+              h("div", { className: "t-tnum", style: { marginTop: 4, fontSize: 11, color: st.over.length ? "var(--red)" : "var(--faint)" } },
+                st.over.length
+                  ? "over on " + listWords(st.over.map(function (c) { return c + " " + fmt(-(st.rows.filter(function (r) { return r.category === c; })[0].remaining), home); }))
+                  : "inside every limit · " + fmt(st.remainingTotal, home) + " unspent"));
+          })),
+          history.length > HISTORY_PREVIEW
+            ? h("button", { type: "button", className: "t-link", style: { marginTop: 8 }, onClick: function () { setAllDays(!allDays); } },
+                allDays ? "Show fewer days" : "Show all " + history.length + " days")
+            : null);
+      })()) : null,
+
     h("section", { className: "t-card t-pad" },
       h("div", { className: "t-sectitle", style: { marginBottom: 8 } }, "How you paid"),
       h("div", { className: "t-metarow", style: { rowGap: 4 } },
@@ -1580,6 +1781,8 @@ function TripScreen(props) {
   const setTxns = props.setTxns;
   const budgets = trip.budgets || {};
   const dailyLimits = trip.dailyLimits || {};
+  const customCategories = trip.customCategories || [];
+  const hasLimits = Object.keys(dailyLimits).length > 0;
 
   const tabS = useState("track"); const tab = tabS[0], setTab = tabS[1];
   const dlES = useState(false); const dlEditing = dlES[0], setDlEditing = dlES[1];
@@ -1589,6 +1792,8 @@ function TripScreen(props) {
   const nameS = useState(trip.name); const nameStr = nameS[0], setNameStr = nameS[1];
   const tbES = useState(false); const tbEditing = tbES[0], setTbEditing = tbES[1];
   const tbSS = useState(""); const tbStr = tbSS[0], setTbStr = tbSS[1];
+  const tsSS = useState(""); const tbStart = tsSS[0], setTbStart = tsSS[1];
+  const teSS = useState(""); const tbEnd = teSS[0], setTbEnd = teSS[1];
   const entryRef = useRef(null);
   const discardRenameRef = useRef(false);
 
@@ -1599,10 +1804,15 @@ function TripScreen(props) {
     const times = txns.map(function (t) { return new Date(t.timestamp).getTime(); });
     return { start: Math.min.apply(null, times), end: Math.max.apply(null, times) };
   }, [txns]);
+  const dayBuckets = useMemo(function () { return bucketByDay(txns); }, [txns]);
+  const catCountries = useMemo(function () { return catCountryMap(customCategories); }, [customCategories]);
   /* today's spend per category, checked against the trip's daily limits */
   const dailyStatus = useMemo(function () {
-    return dailyLimitStatus(dailyLimits, dailySpendByCategory(txns, todayStr(), derived.pools, home, rates));
-  }, [txns, dailyLimits, derived, home, rates]);
+    const today = todayStr();
+    return dailyLimitStatus(dailyLimits, daySummary(dayBuckets[today] || [], today, derived.pools, home, rates), catCountries);
+  }, [dayBuckets, dailyLimits, catCountries, derived, home, rates]);
+  /* where today sits in the trip, and what the budget says you should be at */
+  const pace = useMemo(function () { return tripPace(trip, derived.totalHome); }, [trip.startDate, trip.endDate, trip.budgetTotal, derived.totalHome]);
   const tripCountries = useMemo(function () {
     const seen = {}, out = [];
     const sorted = txns.slice().sort(function (a, b) { return new Date(b.timestamp) - new Date(a.timestamp); });
@@ -1627,7 +1837,8 @@ function TripScreen(props) {
     const limit = limitFor(dailyLimits, item.category);
     if (limit === null) return "";
     const ds = dateStrFromTs(item.timestamp);
-    const spent = dailySpendByCategory(nextList, ds, derived.pools, home, rates)[item.category] || 0;
+    const day = nextList.filter(function (t) { return dateStrFromTs(t.timestamp) === ds; });
+    const spent = daySummary(day, ds, derived.pools, home, rates).byCat[item.category] || 0;
     const remaining = limit - spent;
     const when = ds === todayStr() ? "today" : "that day";
     return " · " + item.category + " " + (remaining < -OVER_EPS
@@ -1678,11 +1889,19 @@ function TripScreen(props) {
 
   /* ---- trip budget ---- */
   const tripBudget = typeof trip.budgetTotal === "number" && trip.budgetTotal > 0 ? trip.budgetTotal : null;
-  function openTripBudget() { setTbStr(tripBudget ? String(tripBudget) : ""); setTbEditing(true); setMenuOpen(false); }
+  function openTripBudget() {
+    setTbStr(tripBudget ? String(tripBudget) : "");
+    setTbStart(validDateStr(trip.startDate)); setTbEnd(validDateStr(trip.endDate));
+    setTbEditing(true); setMenuOpen(false);
+  }
+  function closeTripBudget() { setTbEditing(false); setTbStr(""); setTbStart(""); setTbEnd(""); }
   function saveTripBudget() {
     const v = parseAmount(tbStr);
-    props.onTripBudget(!isNaN(v) && v > 0 ? v : null);
-    setTbEditing(false); setTbStr("");
+    const start = validDateStr(tbStart), end = validDateStr(tbEnd);
+    /* an end before the start is meaningless — keep the start and drop the end */
+    const okEnd = start && end && daysBetween(start, end) < 0 ? "" : end;
+    props.onTripPlan({ budgetTotal: !isNaN(v) && v > 0 ? v : null, startDate: start, endDate: okEnd });
+    closeTripBudget();
   }
 
   /* ---- daily limits ---- */
@@ -1691,7 +1910,7 @@ function TripScreen(props) {
   /* ---- export ---- */
   function slug() { return (trip.name || "trip").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") + "-" + new Date().toISOString().slice(0, 10); }
   function exportJSON() {
-    download(slug() + ".json", JSON.stringify({ exportedAt: new Date().toISOString(), trip: { name: trip.name, budgets: budgets, budgetTotal: trip.budgetTotal, dailyLimits: dailyLimits }, transactions: txns }, null, 2), "application/json");
+    download(slug() + ".json", JSON.stringify({ exportedAt: new Date().toISOString(), trip: { name: trip.name, budgets: budgets, budgetTotal: trip.budgetTotal, dailyLimits: dailyLimits, customCategories: customCategories, startDate: trip.startDate, endDate: trip.endDate }, transactions: txns }, null, 2), "application/json");
     setMenuOpen(false);
   }
   function csvSafe(v) {
@@ -1736,8 +1955,8 @@ function TripScreen(props) {
         menuOpen ? h("div", { className: "t-overlay", onClick: function () { setMenuOpen(false); } }) : null,
         menuOpen ? h("div", { className: "t-menu", role: "menu" },
           h("button", { type: "button", onClick: function () { setMenuOpen(false); setNameStr(trip.name); setRenaming(true); } }, h(EditIcon, null), "Rename trip"),
-          h("button", { type: "button", onClick: openTripBudget }, h(CashIcon, null), tripBudget ? "Edit trip budget" : "Set trip budget"),
-          h("button", { type: "button", onClick: openDailyLimits }, h(CashIcon, null), dailyStatus.rows.length ? "Edit daily limits" : "Set daily limits"),
+          h("button", { type: "button", onClick: openTripBudget }, h(CashIcon, null), "Trip budget & dates"),
+          h("button", { type: "button", onClick: openDailyLimits }, h(CashIcon, null), hasLimits ? "Edit daily limits" : "Set daily limits"),
           h("div", { className: "sep" }),
           h("button", { type: "button", onClick: function () { setMenuOpen(false); props.onShare(); } }, h(ShareIcon, null), "Share trip"),
           h("button", { type: "button", onClick: exportCSV }, h(DownloadIcon, null), "Export CSV"),
@@ -1753,6 +1972,8 @@ function TripScreen(props) {
     (function () {
       const flags = tripFlags(groups.map(function (g) { return { country: g.country }; }), 6);
       const meta = [];
+      if (pace) meta.push(pace.started ? (pace.ended ? "Trip over · " + pace.totalDays + " days" : "Day " + pace.day + " of " + pace.totalDays)
+                                       : "Starts in " + pace.daysToStart + (pace.daysToStart === 1 ? " day" : " days"));
       meta.push(groups.length + " " + (groups.length === 1 ? "country" : "countries"));
       meta.push(txns.length + " " + (txns.length === 1 ? "entry" : "entries"));
       if (tripRange) meta.push(fmtRange(tripRange.start, tripRange.end));
@@ -1779,9 +2000,10 @@ function TripScreen(props) {
 
     tab === "track" ? h("div", null,
       h("div", { ref: entryRef },
-        h(EntryCard, { home: home, rates: rates, pools: derived.pools, tripCountries: tripCountries, editing: editing, onCommit: commit, onCancelEdit: cancelEdit })),
+        h(EntryCard, { home: home, rates: rates, pools: derived.pools, tripCountries: tripCountries, customCategories: customCategories, editing: editing, onCommit: commit, onCancelEdit: cancelEdit })),
       h(DailyLimitsCard, {
-        home: home, limits: dailyLimits, status: dailyStatus, editing: dlEditing,
+        home: home, limits: dailyLimits, categories: customCategories, hasLimits: hasLimits,
+        status: dailyStatus, editing: dlEditing,
         onEdit: function () { setDlEditing(true); }, onClose: function () { setDlEditing(false); },
         onSave: props.onDailyLimits
       }),
@@ -1790,7 +2012,8 @@ function TripScreen(props) {
         h("button", { type: "button", className: "t-link", onClick: function () { setTab("timeline"); } }, "View timeline →")) : null
     ) : null,
     tab === "timeline" ? h(TimelineTab, { txns: txns, groups: groups, home: home, rates: rates, pools: derived.pools, budgets: budgets, onSaveBudgets: props.onBudgets, onStartEdit: startEdit, onRemove: removeTxn, onDuplicate: duplicateTxn, editingId: editing ? editing.id : null }) : null,
-    tab === "insights" ? h(InsightsTab, { txns: txns, groups: groups, pools: derived.pools, home: home, rates: rates, derived: derived }) : null,
+    tab === "insights" ? h(InsightsTab, { txns: txns, groups: groups, pools: derived.pools, home: home, rates: rates, derived: derived,
+      limits: dailyLimits, hasLimits: hasLimits, catCountries: catCountries, buckets: dayBuckets }) : null,
 
     h("footer", { style: { marginTop: 22, textAlign: "center", fontSize: 12, color: "var(--faint)" } }, "Saved on this device · live rates when online")
   );
@@ -1802,15 +2025,31 @@ function TripScreen(props) {
         h("div", { style: { display: "flex", gap: 8 } },
           h("input", { id: "trip-budget", type: "text", inputMode: "decimal", className: "t-input t-tnum", value: tbStr, placeholder: "0", autoFocus: true,
             onChange: function (e) { setTbStr(e.target.value); },
-            onKeyDown: function (e) { if (e.key === "Enter") { e.preventDefault(); saveTripBudget(); } if (e.key === "Escape") { setTbEditing(false); setTbStr(""); } } }),
+            onKeyDown: function (e) { if (e.key === "Enter") { e.preventDefault(); saveTripBudget(); } if (e.key === "Escape") closeTripBudget(); } }),
           h("button", { type: "button", className: "t-btn t-btn-primary t-btn-sm", onClick: saveTripBudget }, "Save"),
           tripBudget
-            ? h("button", { type: "button", className: "t-btn t-btn-ghost t-btn-sm", onClick: function () { props.onTripBudget(null); setTbEditing(false); setTbStr(""); } }, "Remove")
-            : h("button", { type: "button", className: "t-btn t-btn-ghost t-btn-sm", onClick: function () { setTbEditing(false); setTbStr(""); } }, "Cancel")));
+            ? h("button", { type: "button", className: "t-btn t-btn-ghost t-btn-sm", onClick: function () { props.onTripPlan({ budgetTotal: null }); closeTripBudget(); } }, "Remove")
+            : h("button", { type: "button", className: "t-btn t-btn-ghost t-btn-sm", onClick: closeTripBudget }, "Cancel")),
+        h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 12 } },
+          h("div", null,
+            h("label", { className: "t-label", htmlFor: "trip-start" }, "Trip starts"),
+            h("input", { id: "trip-start", type: "date", className: "t-input", value: tbStart,
+              onChange: function (e) { setTbStart(e.target.value); },
+              onKeyDown: function (e) { if (e.key === "Enter") { e.preventDefault(); saveTripBudget(); } } })),
+          h("div", null,
+            h("label", { className: "t-label", htmlFor: "trip-end" }, "Trip ends"),
+            h("input", { id: "trip-end", type: "date", className: "t-input", value: tbEnd, min: tbStart || undefined,
+              onChange: function (e) { setTbEnd(e.target.value); },
+              onKeyDown: function (e) { if (e.key === "Enter") { e.preventDefault(); saveTripBudget(); } } }))),
+        h("div", { style: { marginTop: 8, fontSize: 12, color: "var(--faint)" } },
+          "With both dates set, the budget bar also shows how much you should have spent by today."));
     }
     if (!tripBudget) {
       return h("div", { style: { marginTop: 10 } },
-        h("button", { type: "button", className: "t-link", onClick: openTripBudget }, "+ Set trip budget"));
+        h("button", { type: "button", className: "t-link", onClick: openTripBudget }, "+ Set trip budget"),
+        pace ? h("div", { className: "t-tnum", style: { marginTop: 6, fontSize: 11, color: "var(--faint)" } },
+          pace.started ? (pace.ended ? "Trip ran " + pace.totalDays + " days" : "Day " + pace.day + " of " + pace.totalDays + " · " + pace.daysLeft + " to go")
+                       : pace.totalDays + " days, starting in " + pace.daysToStart + (pace.daysToStart === 1 ? " day" : " days")) : null);
     }
     const remaining = tripBudget - derived.totalHome, over = remaining < -1e-4;
     const pct = Math.max(0, Math.min(100, (derived.totalHome / tripBudget) * 100));
@@ -1819,9 +2058,38 @@ function TripScreen(props) {
       h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 12.5 } },
         h("span", { style: { color: "var(--muted)" } }, "Trip budget · ", h("b", { className: "t-tnum", style: { color: "var(--ink-soft)" } }, fmt(tripBudget, home))),
         h("button", { type: "button", className: "t-link", style: { color: "var(--faint)" }, onClick: openTripBudget }, "Edit")),
-      h("div", { className: "t-bar", style: { marginTop: 7 } }, h("i", { style: { width: pct + "%", background: barColor } })),
+      h("div", { className: "t-bar", style: { marginTop: 7 } },
+        h("i", { style: { width: pct + "%", background: barColor } }),
+        /* the tick marks where a steady spend would have you by tonight */
+        pace && pace.started && !pace.ended
+          ? h("b", { className: "t-pace", style: { left: pace.pacePct + "%" }, title: "Even pace by end of day " + pace.day })
+          : null),
       h("div", { className: "t-tnum", style: { marginTop: 4, fontSize: 11, color: over ? "var(--red)" : "var(--faint)" } },
-        over ? (fmt(-remaining, home) + " over budget") : (fmt(remaining, home) + " left")));
+        over ? (fmt(-remaining, home) + " over budget") : (fmt(remaining, home) + " left")),
+      pace ? paceBlock() : null);
+  }
+
+  /* how the trip total is tracking against the day you're on */
+  function paceBlock() {
+    if (!pace.started) {
+      return h("div", { style: { marginTop: 7, fontSize: 12, color: "var(--muted)" } },
+        "Starts in " + pace.daysToStart + (pace.daysToStart === 1 ? " day" : " days") + " · ",
+        h("b", { className: "t-tnum", style: { color: "var(--ink-soft)" } }, fmt(pace.perDay, home) + " a day"),
+        " across " + pace.totalDays + " days");
+    }
+    const behind = pace.delta >= 0;
+    return h("div", { style: { marginTop: 7 } },
+      h("div", { style: { fontSize: 12.5, color: "var(--muted)" } },
+        h("b", { className: "t-tnum", style: { color: behind ? "var(--green)" : "var(--red)" } },
+          fmt(Math.abs(pace.delta), home) + (behind ? " under pace" : " over pace")),
+        pace.ended ? " · trip finished" : " · day " + pace.day + " of " + pace.totalDays),
+      h("div", { className: "t-tnum", style: { marginTop: 3, fontSize: 11, color: "var(--faint)" } },
+        pace.ended
+          ? fmt(pace.budget, home) + " budgeted over " + pace.totalDays + " days"
+          : fmt(pace.allowed, home) + " allowed by tonight · " +
+            (pace.leftPerDay !== null && pace.leftPerDay > 0
+              ? fmt(pace.leftPerDay, home) + " a day for the " + pace.daysLeft + " left"
+              : "budget spent — " + pace.daysLeft + (pace.daysLeft === 1 ? " day" : " days") + " to go")));
   }
 
   function cashPoolsCard(codes) {
@@ -2122,18 +2390,29 @@ function App() {
 
   /* trip CRUD */
   function newTrip(name) {
-    const t = { id: uid(), name: name, colorIndex: nextColorIndex(trips), budgets: {}, dailyLimits: {}, createdAt: Date.now() };
+    const t = { id: uid(), name: name, colorIndex: nextColorIndex(trips), budgets: {}, dailyLimits: {}, customCategories: [], createdAt: Date.now() };
     setTrips(function (prev) { return prev.concat([t]); });
     setActiveId(t.id);
   }
   function renameTrip(id, name) { setTrips(function (prev) { return prev.map(function (t) { return t.id === id ? Object.assign({}, t, { name: name }) : t; }); }); }
   function setTripBudgets(id, budgets) { setTrips(function (prev) { return prev.map(function (t) { return t.id === id ? Object.assign({}, t, { budgets: budgets }) : t; }); }); }
-  function setTripDailyLimits(id, limits) { setTrips(function (prev) { return prev.map(function (t) { return t.id === id ? Object.assign({}, t, { dailyLimits: sanitizeLimits(limits) }) : t; }); }); }
-  function setTripBudgetTotal(id, v) {
+  /* limits and your own categories are saved together — a limit is only kept
+     while the category it belongs to still exists */
+  function setTripLimits(id, payload) {
+    setTrips(function (prev) { return prev.map(function (t) {
+      if (t.id !== id) return t;
+      const cats = sanitizeCustomCategories(payload.categories);
+      return Object.assign({}, t, { customCategories: cats, dailyLimits: sanitizeLimits(payload.limits, customCatNames(cats)) });
+    }); });
+  }
+  /* whole-trip budget + how long the trip runs (both optional) */
+  function setTripPlan(id, patch) {
     setTrips(function (prev) { return prev.map(function (t) {
       if (t.id !== id) return t;
       const next = Object.assign({}, t);
-      if (v === null) delete next.budgetTotal; else next.budgetTotal = v;
+      if ("budgetTotal" in patch) { if (patch.budgetTotal === null) delete next.budgetTotal; else next.budgetTotal = patch.budgetTotal; }
+      if ("startDate" in patch) { if (!patch.startDate) delete next.startDate; else next.startDate = patch.startDate; }
+      if ("endDate" in patch) { if (!patch.endDate) delete next.endDate; else next.endDate = patch.endDate; }
       return next;
     }); });
   }
@@ -2150,7 +2429,8 @@ function App() {
     const trip = trips.filter(function (t) { return t.id === id; })[0];
     if (!trip) return;
     const mine = txns.filter(function (t) { return t.tripId === id; });
-    const payload = { v: 1, trip: { name: trip.name, colorIndex: trip.colorIndex, budgets: trip.budgets || {}, budgetTotal: trip.budgetTotal, dailyLimits: trip.dailyLimits || {} }, txns: mine };
+    const payload = { v: 1, trip: { name: trip.name, colorIndex: trip.colorIndex, budgets: trip.budgets || {}, budgetTotal: trip.budgetTotal,
+      dailyLimits: trip.dailyLimits || {}, customCategories: trip.customCategories || [], startDate: trip.startDate, endDate: trip.endDate }, txns: mine };
     const link = location.origin + location.pathname + "#trip=" + encodeShare(payload);
     copyText(link).then(function (ok) {
       if (!ok) showToast("Couldn't copy the link");
@@ -2159,7 +2439,10 @@ function App() {
     });
   }
   function addImportedTrip(shared) {
-    const t = { id: uid(), name: shared.name, colorIndex: nextColorIndex(trips), budgets: shared.budgets, dailyLimits: shared.dailyLimits || {}, createdAt: Date.now() };
+    const t = { id: uid(), name: shared.name, colorIndex: nextColorIndex(trips), budgets: shared.budgets,
+      dailyLimits: shared.dailyLimits || {}, customCategories: shared.customCategories || [], createdAt: Date.now() };
+    if (shared.startDate) t.startDate = shared.startDate;
+    if (shared.endDate) t.endDate = shared.endDate;
     if (shared.budgetTotal) t.budgetTotal = shared.budgetTotal;
     const items = shared.txns.map(function (x) { return sanitizeTxn(x, t.id); }).filter(Boolean);
     setTrips(function (prev) { return prev.concat([t]); });
@@ -2199,7 +2482,13 @@ function App() {
     if (data.app === "travel-expenses" && Array.isArray(data.trips) && Array.isArray(data.txns)) {
       if (!window.confirm("Replace everything on this device with this backup? Current trips will be overwritten.")) return;
       const cleanTrips = data.trips.filter(function (t) { return t && t.id && t.name; }).map(function (t) {
-        const ct = { id: String(t.id), name: String(t.name).slice(0, 80), colorIndex: Number(t.colorIndex) || 0, budgets: {}, dailyLimits: sanitizeLimits(t.dailyLimits), createdAt: Number(t.createdAt) || Date.now() };
+        const customCategories = sanitizeCustomCategories(t.customCategories);
+        const ct = { id: String(t.id), name: String(t.name).slice(0, 80), colorIndex: Number(t.colorIndex) || 0, budgets: {},
+          customCategories: customCategories, dailyLimits: sanitizeLimits(t.dailyLimits, customCatNames(customCategories)),
+          createdAt: Number(t.createdAt) || Date.now() };
+        const sd = validDateStr(t.startDate), ed = validDateStr(t.endDate);
+        if (sd) ct.startDate = sd;
+        if (ed) ct.endDate = ed;
         if (t.budgets && typeof t.budgets === "object") Object.keys(t.budgets).slice(0, 100).forEach(function (k) { const v = Number(t.budgets[k]); if (isFinite(v) && v > 0) ct.budgets[String(k).slice(0, 60)] = v; });
         const bt = Number(t.budgetTotal); if (isFinite(bt) && bt > 0) ct.budgetTotal = bt;
         return ct;
@@ -2257,8 +2546,8 @@ function App() {
           ratesStatus: ratesStatus, online: online, onRefresh: fetchRates,
           setTxns: makeTripSetter(activeTrip.id),
           onBudgets: function (b) { setTripBudgets(activeTrip.id, b); },
-          onTripBudget: function (v) { setTripBudgetTotal(activeTrip.id, v); },
-          onDailyLimits: function (l) { setTripDailyLimits(activeTrip.id, l); },
+          onTripPlan: function (p) { setTripPlan(activeTrip.id, p); },
+          onDailyLimits: function (p) { setTripLimits(activeTrip.id, p); },
           onBack: function () { setActiveId(null); }, onRename: function (n) { renameTrip(activeTrip.id, n); },
           onDelete: function () { deleteTrip(activeTrip.id); }, onShare: function () { shareTrip(activeTrip.id); },
           theme: theme, onToggleTheme: toggleTheme, onToast: showToast
