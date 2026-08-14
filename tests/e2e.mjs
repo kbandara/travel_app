@@ -13,11 +13,17 @@ const SHOTS = path.join(os.tmpdir(), "travel-expenses-e2e");
 fs.mkdirSync(SHOTS, { recursive: true });
 
 /* AUD-based reference table; per-base tables derived so cross rates stay consistent */
-const TBL = { AUD: 1, VND: 16000, USD: 0.65, THB: 23, EUR: 0.6, JPY: 97, LKR: 195 };
+const TBL = { AUD: 1, VND: 16000, USD: 0.65, THB: 23, EUR: 0.6, JPY: 97, LKR: 195, CNY: 4.7 };
 function ratesFor(base) {
   const out = {};
   for (const k of Object.keys(TBL)) out[k] = TBL[k] / TBL[base];
   return out;
+}
+
+/* local calendar day, offset in days — matches how the app reads timestamps */
+function dayStr(offset) {
+  const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() + offset);
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
 }
 
 let failures = 0;
@@ -124,13 +130,20 @@ try {
   /* hero total = card 10 + ATM 100 */
   ok((await textOf(page, ".t-big")).trim() === "A$110.00", "hero total A$110.00 (card + ATM, cash not double-counted)");
 
-  /* trip budget */
+  /* trip budget + trip length -> pace against the day you're on */
   await page.click('[aria-label="Trip menu"]');
   await page.click(".t-menu button:has-text('trip budget')");
   await page.fill("#trip-budget", "1000");
+  await page.fill("#trip-start", dayStr(-2));
+  await page.fill("#trip-end", dayStr(7));
   await page.click("button:has-text('Save')");
   await page.waitForSelector("text=A$890.00 left");
   ok(true, "trip budget bar shows A$890.00 left");
+  const paceText = await textOf(page, "body");
+  ok(paceText.includes("Day 3 of 10"), "hero says which day of the trip today is");
+  ok(paceText.includes("A$190.00 under pace"), "A$110 spent against A$300 allowed by tonight = A$190.00 under pace");
+  ok(paceText.includes("A$300.00 allowed by tonight"), "pace line states the allowance to date");
+  ok(paceText.includes("A$111.25 a day for the 8 left"), "remaining budget spread over the days still to come");
 
   /* daily limits per category (Food today = A$10 card + A$12.50 cash) */
   await page.click("text=+ Set daily limits");
@@ -143,6 +156,28 @@ try {
   ok(dailyCard.includes("A$2.50 above that limit today"), "over-limit banner names the amount");
   ok(dailyCard.includes("A$30.00 left"), "Transport untouched today — A$30.00 left");
   ok(dailyCard.includes("Spent today A$22.50 of A$50.00 in limits"), "daily totals line sums the limited categories");
+  /* your own categories — one for where you are, one for a country you aren't in */
+  await page.click(".t-card:has-text('Daily limits') >> text=Edit");
+  await page.fill("#dl-new", "Massage");
+  await page.selectOption("#dl-new-country", "Vietnam");
+  await page.click("#dl-add");
+  await page.fill("#dl-Massage", "30");
+  await page.fill("#dl-new", "HSR");
+  await page.selectOption("#dl-new-country", "China");
+  await page.click("#dl-add");
+  await page.fill("#dl-HSR", "80");
+  await page.fill("#dl-new", "Food");
+  await page.click("#dl-add");
+  await page.waitForSelector("text=already exists");
+  ok(true, "a category that collides with a built-in one is refused");
+  await page.click("button:has-text('Save limits')");
+  await page.waitForSelector("text=Waiting on a country");
+  const customCard = await textOf(page, ".t-card:has-text('Daily limits')");
+  ok(customCard.includes("Massage") && customCard.includes("A$0.00 / A$30.00"), "a category pinned to the country you're in gets a live row");
+  ok(customCard.includes("HSR") && customCard.includes("A$80.00/day"), "a category pinned elsewhere waits instead of cluttering today");
+  ok(!/HSR A\$0\.00 \/ /.test(customCard), "the dormant category has no bar of its own");
+  const catOptions = await page.locator("#f-cat option").allTextContents();
+  ok(catOptions.includes("Massage") && !catOptions.includes("HSR"), "the entry form offers Massage in Vietnam but not HSR");
   await page.screenshot({ path: path.join(SHOTS, "2-trip-track.png") });
   await noHScroll(page, "trip track");
 
@@ -272,8 +307,11 @@ try {
   await dl.saveAs(backupPath);
   const backup = JSON.parse(fs.readFileSync(backupPath, "utf8"));
   ok(backup.app === "travel-expenses" && backup.trips.length === 2 && backup.txns.length === 6, "backup file contains 2 trips / 6 entries");
-  ok(backup.trips.every((t) => t.dailyLimits && t.dailyLimits.Food === 20 && t.dailyLimits.Transport === 30),
+  ok(backup.trips.every((t) => t.dailyLimits && t.dailyLimits.Food === 20 && t.dailyLimits.Transport === 30 && t.dailyLimits.HSR === 80),
     "daily limits are in the backup for both trips (the shared copy carried them too)");
+  ok(backup.trips.every((t) => (t.customCategories || []).some((c) => c.name === "HSR" && c.country === "China")),
+    "your own categories travel with the trip");
+  ok(backup.trips.every((t) => t.startDate === dayStr(-2) && t.endDate === dayStr(7)), "trip dates are in the backup");
 
   await page.click("text=Erase all data");
   await page.waitForSelector("text=No trips yet");
@@ -288,7 +326,10 @@ try {
   ok((await textOf(page, "body")).includes("A$110.00"), "restore brings both trips back with correct totals");
   await page.click(".t-trip");
   await page.waitForSelector("text=Daily limits");
-  ok((await textOf(page, "body")).includes("A$5.63 over"), "restored trip keeps its daily limits");
+  const restored = await textOf(page, "body");
+  ok(restored.includes("A$5.63 over"), "restored trip keeps its daily limits");
+  ok(restored.includes("Waiting on a country"), "restored trip keeps your own categories");
+  ok(restored.includes("Day 3 of 10"), "restored trip keeps its dates, so the pace still reads");
   await page.click('[aria-label="Back to trips"]');
   await page.waitForSelector("text=Your trips");
 
@@ -349,6 +390,65 @@ try {
   ok((await textOf(page3, "body")).includes("A$20.00"), "orphaned entry value visible");
   ok(errors3.length === 0, "no console/page errors in orphan pass" + (errors3.length ? "\n    " + errors3.join("\n    ") : ""));
   await ctx3.close();
+
+  /* ================= daily-limit history pass (multi-day, seeded) ================= */
+  console.log("\n== Daily limits history pass ==");
+  const ctx5 = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, serviceWorkers: "block" });
+  await mockRates(ctx5);
+  const errors5 = [];
+  const page5 = await ctx5.newPage();
+  collectErrors(page5, errors5);
+  await ctx5.addInitScript(() => {
+    /* local noon on the day N days from today, so the app reads the day we mean */
+    const at = (n) => { const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() + n); return d.toISOString(); };
+    const day = (n) => {
+      const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() + n);
+      return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+    };
+    const e = (n, country, currency, cat, local, aud, rate) => ({
+      id: "e" + n + cat + local, tripId: "t1", type: "expense", payment: "card", country, description: cat + " day " + n,
+      category: cat, amountTrip: local, tripCurrency: currency, amountHome: aud, homeCurrency: "AUD", rate, timestamp: at(n)
+    });
+    localStorage.setItem("travel-expense-trips-v1", JSON.stringify([{
+      id: "t1", name: "Japan & China", colorIndex: 0, budgets: {}, createdAt: 1,
+      budgetTotal: 2000, startDate: day(-3), endDate: day(6),
+      customCategories: [{ name: "HSR", country: "China" }],
+      dailyLimits: { Food: 50, HSR: 100 }
+    }]));
+    localStorage.setItem("travel-expense-data-v1", JSON.stringify([
+      e(-3, "Japan", "JPY", "Food", 6790, 70, 97),
+      e(-2, "Japan", "JPY", "Food", 2910, 30, 97),
+      e(-1, "China", "CNY", "Food", 94, 20, 4.7),
+      e(-1, "China", "CNY", "HSR", 658, 140, 4.7),
+      e(0, "China", "CNY", "Food", 47, 10, 4.7)
+    ]));
+  });
+  await page5.goto(BASE);
+  await page5.click(".t-trip");
+  await page5.waitForSelector("text=Tap to rename");
+  const seeded = await textOf(page5, "body");
+  ok(seeded.includes("Day 4 of 10"), "seeded trip is on day 4 of its 10 days");
+  ok(seeded.includes("A$530.00 under pace"), "A$270 spent against A$800 allowed by tonight = A$530.00 under pace");
+  ok(seeded.includes("A$247.14 a day for the 7 left"), "what's left divided over the days still to come");
+  const todayCard = await textOf(page5, ".t-card:has-text('Daily limits')");
+  ok(todayCard.includes("A$10.00 / A$50.00"), "today in China: Food A$10.00 of A$50.00");
+  ok(todayCard.includes("A$0.00 / A$100.00"), "the China-pinned HSR limit is live today because you're in China");
+  ok(!todayCard.includes("Waiting on a country"), "nothing is waiting while you're in the pinned country");
+
+  await page5.click(".t-seg button:has-text('Insights')");
+  await page5.waitForSelector("text=Daily limits · history");
+  const hist = await textOf(page5, ".t-card:has-text('Daily limits · history')");
+  ok(hist.includes("2 of 4"), "history scores 2 clean days out of the 4 with limits");
+  ok(hist.includes("over on HSR A$40.00"), "the day HSR ran over is named with the amount");
+  ok(hist.includes("over on Food A$20.00"), "the day Food ran over is named with the amount");
+  ok(hist.includes("inside every limit"), "clean days say so");
+  ok(hist.includes("A$160.00 / A$150.00"), "a day's spend is shown against the limits that applied that day");
+  ok(hist.includes("A$70.00 / A$50.00"), "the Japan days only count the limits that applied there (no HSR)");
+  ok((await page5.locator(".t-card:has-text('Daily limits · history') .t-hrow").count()) === 4, "one history row per tracked day");
+  await page5.screenshot({ path: path.join(SHOTS, "7-limit-history.png") });
+  await noHScroll(page5, "limit history");
+  ok(errors5.length === 0, "no console/page errors in history pass" + (errors5.length ? "\n    " + errors5.join("\n    ") : ""));
+  await ctx5.close();
 
   /* ================= service worker / offline pass ================= */
   console.log("\n== Service worker & offline pass ==");

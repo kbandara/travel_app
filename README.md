@@ -12,6 +12,9 @@ A multi-trip, multi-country travel spend tracker that runs entirely in the brows
 - **Live FX rates** from [open.er-api.com](https://open.er-api.com), cached for offline use, with a manual-rate fallback and an auto-refresh toggle.
 - **Budgets** — a whole-trip budget plus per-country budgets, with progress bars and over-budget warnings.
 - **Daily limits** — a per-category daily cap (Food, Transport, Stay, Activities, Shopping, Other). The Track tab shows today's spend against each limit and says plainly whether you're under or over, and every entry you add, edit or duplicate reports what that category has left for the day. Limits are per trip, in your home currency, and reset each calendar day.
+- **Your own categories** — add categories the standard list doesn't cover and give them a daily limit like any other. Pin one to a country (an *HSR* limit for China, an *Onsen* limit for Japan) and it's only offered — and only checked — while you're there; elsewhere it waits quietly instead of cluttering today.
+- **Daily limits history** — Insights keeps the day-by-day record: how many days you finished inside your limits, and for each day what you spent against the limits that applied there, with the days you went over named and priced.
+- **Budget pace** — give the trip a start and end date and the budget bar gains a pace marker: which day of the trip you're on, how much you should have spent by tonight, whether you're under or over that line, and what's left per day for the days still to come.
 - **Timeline** — newest first: entries grouped by country, most recently visited country on top, with day headers, search, and filter chips (category / card / cash / ATM). Long lists are capped with "show all".
 - **Insights** — average per day, largest spend, category breakdown, daily spend for the last 14 days, per-country totals, and a payment split. Cash spends are valued at your blended ATM rate.
 - **Editing** — edit, duplicate, or delete any entry; deletes offer a 6-second **Undo**.
@@ -37,7 +40,7 @@ When you change any cached file, bump `VERSION` in `sw.js` so installed clients 
 
 ## Tests
 
-An end-to-end Playwright suite drives the real app in Chromium — entries, cash pools, budgets, daily limits, filters, undo, insights math, currency switching, share/import, backup/restore, legacy-data migration, and offline start via the service worker:
+An end-to-end Playwright suite drives the real app in Chromium — entries, cash pools, budgets, daily limits and their history, country-pinned categories, budget pace, filters, undo, insights math, currency switching, share/import, backup/restore, legacy-data migration, and offline start via the service worker:
 
 ```sh
 npm install --no-save playwright   # once; downloads may need `npx playwright install chromium`
