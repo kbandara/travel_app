@@ -155,8 +155,8 @@ try {
   ok(dailyCard.includes("A$22.50 / A$20.00") && dailyCard.includes("A$2.50 over"), "Food today: A$22.50 of A$20.00 — A$2.50 over");
   ok(dailyCard.includes("A$2.50 above that limit today"), "over-limit banner names the amount");
   ok(dailyCard.includes("A$30.00 left"), "Transport untouched today — A$30.00 left");
-  ok(dailyCard.includes("Spent today A$22.50 of A$50.00 in limits"), "daily totals line sums the limited categories");
-  /* your own categories — one for where you are, one for a country you aren't in */
+  ok(dailyCard.includes("Spent today A$22.50 of A$50.00 in \u{1F1FB}\u{1F1F3} Vietnam limits"), "daily totals line sums the limits for the country you're in");
+  /* your own categories, and a second country with its own limits */
   await page.click(".t-card:has-text('Daily limits') >> text=Edit");
   await page.fill("#dl-new", "Massage");
   await page.selectOption("#dl-new-country", "Vietnam");
@@ -165,17 +165,23 @@ try {
   await page.fill("#dl-new", "HSR");
   await page.selectOption("#dl-new-country", "China");
   await page.click("#dl-add");
-  await page.fill("#dl-HSR", "80");
+  ok((await page.locator("#dl-HSR").count()) === 0, "a category pinned to China doesn't clutter Vietnam's limits");
   await page.fill("#dl-new", "Food");
   await page.click("#dl-add");
   await page.waitForSelector("text=already exists");
   ok(true, "a category that collides with a built-in one is refused");
+  /* switch the editor to China and give that country its own numbers */
+  await page.selectOption("#dl-country", "China");
+  await page.waitForSelector("#dl-HSR");
+  ok((await page.inputValue("#dl-Food")) === "", "each country starts from its own blank slate, not Vietnam's numbers");
+  await page.fill("#dl-Food", "40");
+  await page.fill("#dl-HSR", "80");
   await page.click("button:has-text('Save limits')");
-  await page.waitForSelector("text=Waiting on a country");
+  await page.waitForSelector("text=Over on Food");
   const customCard = await textOf(page, ".t-card:has-text('Daily limits')");
   ok(customCard.includes("Massage") && customCard.includes("A$0.00 / A$30.00"), "a category pinned to the country you're in gets a live row");
-  ok(customCard.includes("HSR") && customCard.includes("A$80.00/day"), "a category pinned elsewhere waits instead of cluttering today");
-  ok(!/HSR A\$0\.00 \/ /.test(customCard), "the dormant category has no bar of its own");
+  ok(!customCard.includes("HSR"), "China's limits stay out of a Vietnam day");
+  ok(customCard.includes("A$22.50 / A$20.00"), "Vietnam's Food limit is still the one being checked");
   const catOptions = await page.locator("#f-cat option").allTextContents();
   ok(catOptions.includes("Massage") && !catOptions.includes("HSR"), "the entry form offers Massage in Vietnam but not HSR");
   await page.screenshot({ path: path.join(SHOTS, "2-trip-track.png") });
@@ -307,8 +313,10 @@ try {
   await dl.saveAs(backupPath);
   const backup = JSON.parse(fs.readFileSync(backupPath, "utf8"));
   ok(backup.app === "travel-expenses" && backup.trips.length === 2 && backup.txns.length === 6, "backup file contains 2 trips / 6 entries");
-  ok(backup.trips.every((t) => t.dailyLimits && t.dailyLimits.Food === 20 && t.dailyLimits.Transport === 30 && t.dailyLimits.HSR === 80),
-    "daily limits are in the backup for both trips (the shared copy carried them too)");
+  ok(backup.trips.every((t) => t.dailyLimits && t.dailyLimits.Vietnam && t.dailyLimits.Vietnam.Food === 20 && t.dailyLimits.Vietnam.Transport === 30),
+    "Vietnam's daily limits are in the backup for both trips (the shared copy carried them too)");
+  ok(backup.trips.every((t) => t.dailyLimits.China && t.dailyLimits.China.HSR === 80 && t.dailyLimits.China.Food === 40),
+    "China's separate limits are in the backup too");
   ok(backup.trips.every((t) => (t.customCategories || []).some((c) => c.name === "HSR" && c.country === "China")),
     "your own categories travel with the trip");
   ok(backup.trips.every((t) => t.startDate === dayStr(-2) && t.endDate === dayStr(7)), "trip dates are in the backup");
@@ -328,7 +336,7 @@ try {
   await page.waitForSelector("text=Daily limits");
   const restored = await textOf(page, "body");
   ok(restored.includes("A$5.63 over"), "restored trip keeps its daily limits");
-  ok(restored.includes("Waiting on a country"), "restored trip keeps your own categories");
+  ok(restored.includes("Massage"), "restored trip keeps your own categories");
   ok(restored.includes("Day 3 of 10"), "restored trip keeps its dates, so the pace still reads");
   await page.click('[aria-label="Back to trips"]');
   await page.waitForSelector("text=Your trips");
@@ -413,7 +421,7 @@ try {
       id: "t1", name: "Japan & China", colorIndex: 0, budgets: {}, createdAt: 1,
       budgetTotal: 2000, startDate: day(-3), endDate: day(6),
       customCategories: [{ name: "HSR", country: "China" }],
-      dailyLimits: { Food: 50, HSR: 100 }
+      dailyLimits: { Japan: { Food: 50 }, China: { Food: 50, HSR: 100 } }
     }]));
     localStorage.setItem("travel-expense-data-v1", JSON.stringify([
       e(-3, "Japan", "JPY", "Food", 6790, 70, 97),
@@ -432,11 +440,28 @@ try {
   ok(seeded.includes("A$247.14 a day for the 7 left"), "what's left divided over the days still to come");
   const todayCard = await textOf(page5, ".t-card:has-text('Daily limits')");
   ok(todayCard.includes("A$10.00 / A$50.00"), "today in China: Food A$10.00 of A$50.00");
-  ok(todayCard.includes("A$0.00 / A$100.00"), "the China-pinned HSR limit is live today because you're in China");
-  ok(!todayCard.includes("Waiting on a country"), "nothing is waiting while you're in the pinned country");
+  ok(todayCard.includes("A$0.00 / A$100.00"), "China's HSR limit is the one being checked today");
+  ok(todayCard.includes("in \u{1F1E8}\u{1F1F3} China limits"), "the card names the country whose limits apply");
 
   await page5.click(".t-seg button:has-text('Insights')");
   await page5.waitForSelector("text=Daily limits · history");
+
+  /* insights: outlook, cost per day, biggest spends, sharper tiles */
+  const outlook = await textOf(page5, ".t-card:has-text('Where this is heading')");
+  ok(outlook.includes("A$675.00"), "projects the finish at A$675.00 (A$67.50/day across 10 days)");
+  ok(outlook.includes("A$1,325.00 under budget"), "compares the projection with the A$2,000 budget");
+  ok(outlook.includes("A$67.50 a day across 4 of 10 days"), "states the burn rate it projected from");
+  ok(outlook.includes("A$247.14 a day keeps you inside it"), "says what a day can cost from here on");
+  const perDay = await textOf(page5, ".t-card:has-text('What a day costs')");
+  ok(perDay.includes("A$85.00 / day") && perDay.includes("A$170.00 over 2 days"), "China costs A$85.00 a day over 2 days");
+  ok(perDay.includes("A$50.00 / day") && perDay.includes("A$100.00 over 2 days"), "Japan costs A$50.00 a day over 2 days");
+  ok(perDay.indexOf("China") < perDay.indexOf("Japan"), "the priciest day sorts first");
+  const tiles = await textOf(page5, ".t-tiles");
+  ok(tiles.includes("A$67.50") && tiles.includes("median A$50.00"), "avg-per-day tile carries the median too (days of 70/30/160/10)");
+  ok(tiles.includes("A$160.00"), "biggest-day tile shows the day, not just the entry");
+  const top = await textOf(page5, ".t-card:has-text('Biggest spends')");
+  ok(top.indexOf("A$140.00") < top.indexOf("A$70.00"), "biggest spends are ranked");
+  ok(top.includes("HSR · "), "each spend says what it was and where");
   const hist = await textOf(page5, ".t-card:has-text('Daily limits · history')");
   ok(hist.includes("2 of 4"), "history scores 2 clean days out of the 4 with limits");
   ok(hist.includes("over on HSR A$40.00"), "the day HSR ran over is named with the amount");
@@ -449,6 +474,40 @@ try {
   await noHScroll(page5, "limit history");
   ok(errors5.length === 0, "no console/page errors in history pass" + (errors5.length ? "\n    " + errors5.join("\n    ") : ""));
   await ctx5.close();
+
+  /* ================= v2 daily-limit migration (flat -> per country) ================= */
+  console.log("\n== Daily-limit migration pass (v2 flat limits) ==");
+  const ctx6 = await browser.newContext({ viewport: { width: 390, height: 844 }, serviceWorkers: "block" });
+  await mockRates(ctx6);
+  const errors6 = [];
+  const page6 = await ctx6.newPage();
+  collectErrors(page6, errors6);
+  await ctx6.addInitScript(() => {
+    const at = (n) => { const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() + n); return d.toISOString(); };
+    localStorage.setItem("travel-expense-trips-v1", JSON.stringify([{
+      id: "t9", name: "Old shape", colorIndex: 0, budgets: {}, createdAt: 1,
+      dailyLimits: { Food: 50, Transport: 20 }   /* how v2 stored them: one set for the whole trip */
+    }]));
+    localStorage.setItem("travel-expense-data-v1", JSON.stringify([
+      { id: "m1", tripId: "t9", type: "expense", payment: "card", country: "Thailand", description: "Pad thai", category: "Food",
+        amountTrip: 230, tripCurrency: "THB", amountHome: 10, homeCurrency: "AUD", rate: 23, timestamp: at(-1) },
+      { id: "m2", tripId: "t9", type: "expense", payment: "card", country: "Vietnam", description: "Banh mi", category: "Food",
+        amountTrip: 32000, tripCurrency: "VND", amountHome: 2, homeCurrency: "AUD", rate: 16000, timestamp: at(0) }
+    ]));
+  });
+  await page6.goto(BASE);
+  await page6.click(".t-trip");
+  await page6.waitForSelector("text=Daily limits · today");
+  const migrated = await textOf(page6, ".t-card:has-text('Daily limits')");
+  ok(migrated.includes("A$2.00 / A$50.00"), "v2 limits now apply to Vietnam, where today's spend is");
+  ok(migrated.includes("in \u{1F1FB}\u{1F1F3} Vietnam limits"), "today is judged against Vietnam's copy of them");
+  await page6.click(".t-seg button:has-text('Insights')");
+  await page6.waitForSelector("text=Daily limits · history");
+  const migHist = await textOf(page6, ".t-card:has-text('Daily limits · history')");
+  ok(migHist.includes("2 of 2"), "both countries kept the old limits, so both days are scored");
+  ok(migHist.includes("A$10.00 / A$70.00"), "the Thailand day carries the migrated limits too");
+  ok(errors6.length === 0, "no console/page errors in migration pass" + (errors6.length ? "\n    " + errors6.join("\n    ") : ""));
+  await ctx6.close();
 
   /* ================= service worker / offline pass ================= */
   console.log("\n== Service worker & offline pass ==");

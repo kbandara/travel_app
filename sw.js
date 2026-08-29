@@ -5,7 +5,7 @@
    the background. Cross-origin requests (the FX rates API) are not intercepted
    — the app has its own cached-rates fallback in localStorage. */
 
-var VERSION = "v5";
+var VERSION = "v6";
 var CACHE = "travel-expenses-" + VERSION;
 var SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon.svg"];
 
